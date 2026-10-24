@@ -16,7 +16,7 @@
     },
     {
       "name": "core",
-      "description": "Preset for any code repo under the workflow: ai-sdlc, ponytail, cozy-view, cozy-setup.",
+      "description": "Preset for any code repo under the workflow: ai-sdlc, ponytail, cozy-view, cozy-setup, cozy-cleanup.",
       "source": "./plugins/core",
       "category": "preset"
     },
