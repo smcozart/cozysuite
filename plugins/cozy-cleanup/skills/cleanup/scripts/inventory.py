@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Read-only inventory for the cleanup skill: what on this machine can go, and why.
 
-Prints JSON. It never deletes, pushes, commits or edits anything. The only write
-is `git fetch --prune` per clone, which `--no-fetch` turns off. Git reads use
-`--no-optional-locks`, so they never take a lock another agent may need.
+Prints JSON. It never deletes, pushes, commits or edits anything. Its only write
+is `git fetch --prune` per clone that is not active (`--no-fetch` turns it off).
+Git reads use `--no-optional-locks`, so they never take a lock another agent needs.
 
 Verdicts, strongest first:
   active        in use, in flight, or changed within --active-hours: leave it
-  keep          an ongoing project (keep marker, recent local use, recent push)
-  unsafe        something here is on no remote, or its state is unknown
-  backup-first  all git work is on a remote; local-only ignored files remain
-  safe          everything here is on a remote
+  keep          an ongoing project (keep marker, recent use, recent push, .factory state)
+  unsafe        something is on no server remote, or its state is unknown
+  backup-first  all git work is on a server remote; local-only ignored files remain
+  safe          everything is on a server remote
+A copy on another folder of this disk never counts: only remotes on a server do.
 """
 import argparse
 import datetime
@@ -19,11 +20,13 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 
 HOME = os.path.expanduser("~")
 # Ignored folders and files that a build or install makes again. Everything else
-# that git ignores (.env, local databases, notes) is local-only and is backed up.
+# git ignores (.env, local databases, notes) is local-only and goes to a backup.
+# Untracked (not ignored) files are never treated as build output.
 REGEN_NAMES = {
     "node_modules", "dist", "build", "out", ".astro", ".next", ".nuxt", ".svelte-kit",
     "__pycache__", ".venv", "venv", ".tox", ".pytest_cache", ".mypy_cache", ".ruff_cache",
@@ -31,14 +34,18 @@ REGEN_NAMES = {
     ".wrangler", ".DS_Store", ".phpunit.cache", ".phpunit.result.cache",
 }
 REGEN_PATHS = ("storage/framework", "storage/logs", "storage/pail", "bootstrap/cache")
+# ponytail: node_modules is never walked for nested repos (size); a repo inside it is missed.
+SKIP_WALK = {".git", "node_modules"}
 IN_PROGRESS = ("index.lock", "MERGE_HEAD", "rebase-merge", "rebase-apply",
                "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG")
+CAP = 200  # files listed per folder; past this the folder itself is listed
+ENV = dict(os.environ, GIT_TERMINAL_PROMPT="0", GH_PROMPT_DISABLED="1",
+           GIT_SSH_COMMAND=os.environ.get("GIT_SSH_COMMAND", "ssh -oBatchMode=yes"))
 
 
 def run(cmd, timeout=120):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           env=dict(os.environ, GIT_TERMINAL_PROMPT="0", GH_PROMPT_DISABLED="1"))
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=ENV)
         return p.returncode, p.stdout
     except (OSError, subprocess.TimeoutExpired):
         return 1, ""
@@ -74,35 +81,85 @@ def is_linked_worktree(d):
     return rc1 == 0 and rc2 == 0 and os.path.realpath(gd.strip()) != os.path.realpath(cd.strip())
 
 
+def hosted(url):
+    """A remote on a server, not another folder on this disk."""
+    return bool(re.match(r"^(https?|ssh|git)://[^/]+/", url or "")
+                or re.match(r"^[\w.-]+@[\w.-]+:", url or ""))
+
+
+def gh_slug(url):
+    m = re.search(r"github\.com[:/]([^/]+)/([^/\s]+?)(?:\.git)?/?$", url or "")
+    return f"{m.group(1)}/{m.group(2)}" if m else None
+
+
 def regenerable(rel):
     rel = rel.rstrip("/")
     return (any(part in REGEN_NAMES for part in rel.split("/"))
-            or any(rel == p or rel.startswith(p + "/") or ("/" + p + "/") in ("/" + rel + "/")
-                   for p in REGEN_PATHS))
+            or any(("/" + p + "/") in ("/" + rel + "/") for p in REGEN_PATHS))
 
 
-def find_repos(root, max_depth):
-    """Git repos under root; does not descend into a repo it found."""
+def find_repos(root, max_depth=None):
+    """Git repos under root (root itself if it is one); stops at each repo it finds."""
+    if is_repo(root):
+        return [root]
     found = []
 
     def walk(d, depth):
-        if depth > 0 and is_repo(d):
-            found.append(d)
-            return
-        if depth == max_depth:
-            return
         try:
             entries = list(os.scandir(d))
         except OSError:
             return
         for e in entries:
-            if e.is_dir(follow_symlinks=False) and e.name != ".git" and e.name not in REGEN_NAMES:
+            if not e.is_dir(follow_symlinks=False) or e.name in SKIP_WALK:
+                continue
+            if is_repo(e.path):
+                found.append(e.path)
+            elif max_depth is None or depth < max_depth:
                 walk(e.path, depth + 1)
 
-    if is_repo(root):
-        return [root]
-    walk(root, 0)
+    walk(root, 1)
     return found
+
+
+def nested_repos(repo):
+    """Repos inside repo at any depth, stopping at each (their own nested come from recursion)."""
+    found = []
+    try:
+        entries = list(os.scandir(repo))
+    except OSError:
+        return found
+    for e in entries:
+        if e.is_dir(follow_symlinks=False) and e.name not in SKIP_WALK:
+            found += [n for n in find_repos(e.path) if not is_linked_worktree(n)]
+    return found
+
+
+def walk_files(repo, full, nested, skip_regen):
+    """Files under a folder, outside nested repos (and outside build output when
+    skip_regen). Returns (paths relative to repo, capped, newest mtime)."""
+    hits, newest = [], 0.0
+    if os.path.isfile(full) or os.path.islink(full):
+        try:
+            newest = os.lstat(full).st_mtime
+        except OSError:
+            pass
+        return [os.path.relpath(full, repo)], False, newest
+    for d, dirs, files in os.walk(full):
+        dirs[:] = [x for x in dirs if x not in SKIP_WALK and not (skip_regen and x in REGEN_NAMES)
+                   and os.path.join(d, x) not in nested]
+        for f in files:
+            fp = os.path.join(d, f)
+            r = os.path.relpath(fp, repo)
+            if skip_regen and regenerable(r):
+                continue
+            try:
+                newest = max(newest, os.lstat(fp).st_mtime)
+            except OSError:
+                pass
+            hits.append(r)
+            if len(hits) >= CAP:
+                return hits, True, newest
+    return hits, False, newest
 
 
 def worktrees(repo):
@@ -116,31 +173,32 @@ def worktrees(repo):
             continue
         key, _, val = line.partition(" ")
         cur[key] = val or True
-    return items  # items[0] is the main working tree
+    return items  # items[0] is the main working tree (or the bare repo)
 
 
-def busy_dirs():
-    """Working folders of running processes and herdr agents; None if unknown."""
+def busy_paths():
+    """Every path a process has open (files and working folders), plus herdr agent
+    folders. None when lsof gives nothing: then nothing can be proved idle."""
     if not shutil.which("lsof"):
         return None
-    _, out = run(["lsof", "-a", "-d", "cwd", "-Fn"], timeout=90)
-    dirs = {os.path.realpath(l[1:]) for l in out.splitlines() if l.startswith("n/")}
-    if not dirs:
+    _, out = run(["lsof", "-w", "-Fn"], timeout=180)
+    paths = {os.path.realpath(l[1:]) for l in out.splitlines() if l.startswith("n/")}
+    if not paths:
         return None
     if shutil.which("herdr"):
-        rc, out = run(["herdr", "agent", "list"], timeout=20)
+        _, out = run(["herdr", "agent", "list"], timeout=20)
         try:
             for a in json.loads(out)["result"]["agents"]:
                 for k in ("cwd", "foreground_cwd"):
                     if a.get(k):
-                        dirs.add(os.path.realpath(a[k]))
+                        paths.add(os.path.realpath(a[k]))
         except (ValueError, KeyError, TypeError):
             pass
-    return dirs
+    return paths
 
 
 def other_claude_sessions():
-    _, out = run(["ps", "-axo", "pid=,ppid=,comm="])
+    _, out = run(["ps", "-axo", "pid=,ppid=,command="])
     procs = {}
     for line in out.splitlines():
         parts = line.split(None, 2)
@@ -150,20 +208,27 @@ def other_claude_sessions():
     while p in procs and p not in mine and p > 1:
         mine.add(p)
         p = procs[p][0]
-    return sum(1 for pid, (_, comm) in procs.items()
-               if os.path.basename(comm) == "claude" and pid not in mine)
+    claude = re.compile(r"(^|/)claude(\s|$)|@anthropic-ai/claude-code|claude-code/cli")
+    return sum(1 for pid, (_, cmd) in procs.items() if pid not in mine and claude.search(cmd))
 
 
 class Ctx:
     def __init__(self, a):
         self.a = a
-        self.busy = busy_dirs()
-        self.gh = None
+        self._busy = False  # not taken yet
+        self.gh = False
         if not a.no_gh and shutil.which("gh"):
             self.gh = run(["gh", "auth", "status"], timeout=20)[0] == 0
         self._cache = {}
 
+    @property
+    def busy(self):
+        if self._busy is False:
+            self._busy = busy_paths()
+        return self._busy
+
     def gh_json(self, args):
+        """Parsed JSON, or None when gh failed (an error is never 'nothing found')."""
         key = tuple(args)
         if key not in self._cache:
             rc, out = run(["gh", *args], timeout=60)
@@ -174,51 +239,21 @@ class Ctx:
         return self._cache[key]
 
 
-def gh_slug(url):
-    m = re.search(r"github\.com[:/]([^/]+)/([^/\s]+?)(?:\.git)?/?$", url or "")
-    return f"{m.group(1)}/{m.group(2)}" if m else None
-
-
-def default_branch(repo):
-    rc, out = git(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
-    return out.strip().split("/", 1)[-1] if rc == 0 else "main"
-
-
-def nested_repos(repo):
-    """Repos inside repo (not linked worktrees: those come from `git worktree list`)."""
-    found = []
-    try:
-        entries = list(os.scandir(repo))
-    except OSError:
-        return found
-    for e in entries:
-        if e.is_dir(follow_symlinks=False) and e.name != ".git" and e.name not in REGEN_NAMES:
-            found += [n for n in find_repos(e.path, 3) if not is_linked_worktree(n)]
-    return found
-
-
-def loose_files(repo, full, nested):
-    """Files under a folder that holds nested repos, outside those repos and build output."""
-    hits = []
-    for d, dirs, files in os.walk(full):
-        dirs[:] = [x for x in dirs if x != ".git" and x not in REGEN_NAMES
-                   and os.path.join(d, x) not in nested and not is_repo(os.path.join(d, x))]
-        for f in files:
-            r = os.path.relpath(os.path.join(d, f), repo)
-            if not regenerable(r):
-                hits.append(r)
-            if len(hits) >= 200:
-                return hits
-    return hits
+def in_use(path, ctx):
+    if ctx.busy is None:
+        return "cannot tell whether a process uses this folder (lsof gave nothing)"
+    real = os.path.realpath(path)
+    if any(p == real or p.startswith(real + os.sep) for p in ctx.busy):
+        return "a running process or agent has files or its working folder here"
+    return None
 
 
 def keep_marker(repo):
-    """git config cleanup.keepUntil (YYYY-MM-DD) / cleanup.keepReason; local to this clone."""
-    _, until = git(repo, "config", "--get", "cleanup.keepUntil")
-    _, reason = git(repo, "config", "--get", "cleanup.keepReason")
-    _, flag = git(repo, "config", "--get", "cleanup.keep")
-    until, reason, flag = until.strip(), reason.strip(), flag.strip()
-    if not (until or reason or flag):
+    """git config cleanup.keepUntil (YYYY-MM-DD) / cleanup.keepReason / cleanup.keep."""
+    vals = [git(repo, "config", "--get", k)[1].strip()
+            for k in ("cleanup.keepUntil", "cleanup.keepReason", "cleanup.keep")]
+    until, reason, _ = vals
+    if not any(vals):
         return None, None
     if until:
         try:
@@ -230,6 +265,29 @@ def keep_marker(repo):
     return "marked ongoing" + (f": {reason}" if reason else ""), None
 
 
+def default_branch(repo):
+    rc, out = git(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    return out.strip().split("/", 1)[-1] if rc == 0 else "main"
+
+
+def hidden_changes(path):
+    """skip-worktree / assume-unchanged files whose content differs from git."""
+    _, out = git(path, "ls-files", "-v", "-z")
+    flagged = [e[2:] for e in out.split("\0") if len(e) > 2 and (e[0] == "S" or e[0].islower())]
+    on_disk = [f for f in flagged if os.path.lexists(os.path.join(path, f))][:2000]
+    if not on_disk:
+        return 0
+    _, staged = git(path, "ls-files", "-s", "-z", "--", *on_disk)
+    index = {}
+    for e in staged.split("\0"):
+        if "\t" in e:
+            meta, f = e.split("\t", 1)
+            index[f] = meta.split()[1]
+    p = subprocess.run(["git", "--no-optional-locks", "-C", path, "hash-object", "--stdin-paths"],
+                       input="\n".join(on_disk), capture_output=True, text=True, env=ENV)
+    return sum(1 for f, h in zip(on_disk, p.stdout.split()) if index.get(f) != h)
+
+
 def inspect(path, kind, ctx, nested=()):
     a = ctx.a
     rec = {"path": path, "kind": kind, "verdict": None, "active": [], "keep": [], "unsafe": [],
@@ -239,6 +297,8 @@ def inspect(path, kind, ctx, nested=()):
     if rc != 0:
         rec["unsafe"].append("not a readable git repo")
         return rec
+    _, common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    common = common.strip()
 
     # Activity first: later git commands must not be what makes it look recent.
     stamps = [os.path.getmtime(os.path.join(gitdir, f)) for f in ("index", "HEAD", "logs/HEAD")
@@ -250,36 +310,47 @@ def inspect(path, kind, ctx, nested=()):
     for f in IN_PROGRESS:
         if os.path.exists(os.path.join(gitdir, f)):
             rec["active"].append(f"git operation in progress ({f})")
-    if ctx.busy is None:
-        rec["active"].append("cannot tell whether a process works here (lsof gave nothing)")
-    else:
-        real = os.path.realpath(path)
-        if any(d == real or d.startswith(real + os.sep) for d in ctx.busy):
-            rec["active"].append("a running process or agent works in this folder")
+    busy = in_use(path, ctx)
+    if busy:
+        rec["active"].append(busy)
 
-    if not a.no_fetch and kind != "worktree":
-        if git(path, "fetch", "--all", "--prune", "--quiet", timeout=300)[0] != 0:
+    if not a.no_fetch and kind != "worktree" and not rec["active"]:
+        if git(path, "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+               "fetch", "--all", "--prune", "--quiet", timeout=300)[0] != 0:
             rec["unsafe"].append("git fetch failed: what is on the remote is unknown")
 
-    _, remotes = git(path, "remote")
-    rc, url = git(path, "remote", "get-url", "origin")
-    rec["remote"] = url.strip() if rc == 0 else None
-    if not remotes.strip():
-        rec["unsafe"].append("no remote: nothing here is on GitHub")
-    slug = gh_slug(rec["remote"])
-    info = ctx.gh_json(["repo", "view", slug, "--json", "isArchived,pushedAt"]) if slug and ctx.gh else None
+    _, rv = git(path, "config", "--get-regexp", r"^remote\..*\.url$")
+    remotes = {}
+    for line in rv.splitlines():
+        k, _, url = line.partition(" ")
+        remotes[k[len("remote."):-len(".url")]] = url.strip()
+    servers = [n for n, u in remotes.items() if hosted(u)]
+    for n, u in remotes.items():
+        if n not in servers:
+            rec["unsafe"].append(f"remote {n} is a folder on this disk ({u}): its copy does not count")
+    if not servers:
+        rec["unsafe"].append("no remote on a server: nothing here is on GitHub")
+    rec["remote"] = remotes.get("origin") or (remotes[servers[0]] if servers else None)
+    not_on = [f"--remotes={n}/*" for n in servers]
+    slug = next((gh_slug(remotes[n]) for n in sorted(servers, key=lambda n: n != "origin")
+                 if gh_slug(remotes[n])), None)
+    info = ctx.gh_json(["repo", "view", slug, "--json", "isArchived,pushedAt,visibility"]) if slug and ctx.gh else None
     rec["archived"] = info.get("isArchived") if info else None
+    rec["visibility"] = info.get("visibility") if info else None
 
+    # Every commit reachable from a local ref must be on a server remote.
+    detached = git(path, "symbolic-ref", "--quiet", "HEAD")[0] != 0
     if kind == "worktree":
         rc, b = git(path, "symbolic-ref", "--quiet", "--short", "HEAD")
         branches = [b.strip()] if rc == 0 else []
+        others = ["HEAD"] if detached else []
     else:
-        _, out = git(path, "for-each-ref", "refs/heads", "--format=%(refname:short)")
-        branches = out.split()
-    default = default_branch(path)
-
+        _, out = git(path, "for-each-ref", "--format=%(refname)")
+        refs = [r for r in out.split() if not r.startswith("refs/remotes/") and r != "refs/stash"]
+        branches = [r[len("refs/heads/"):] for r in refs if r.startswith("refs/heads/")]
+        others = [r for r in refs if not r.startswith("refs/heads/")] + (["HEAD"] if detached else [])
     for b in branches:
-        rc, n = git(path, "rev-list", "--count", f"refs/heads/{b}", "--not", "--remotes", "--")
+        rc, n = git(path, "rev-list", "--count", f"refs/heads/{b}", "--not", *not_on, "--")
         if rc != 0:
             rec["unsafe"].append(f"branch {b}: cannot count its commits")
             continue
@@ -288,39 +359,69 @@ def inspect(path, kind, ctx, nested=()):
         _, tip = git(path, "rev-parse", "--verify", f"refs/heads/{b}")
         if slug and ctx.gh:
             prs = ctx.gh_json(["pr", "list", "-R", slug, "--head", b, "--state", "merged",
-                               "--json", "number,headRefOid", "--limit", "50"]) or []
-            hit = [p["number"] for p in prs if p.get("headRefOid") == tip.strip()]
+                               "--json", "number,headRefOid", "--limit", "50"])
+            hit = [p["number"] for p in prs or [] if p.get("headRefOid") == tip.strip()]
             if hit:
                 rec["notes"].append(f"branch {b}: on no remote branch, but merged as PR #{hit[0]} at this tip")
                 rec.setdefault("merged_branches", []).append(b)
                 continue
         rec["unpushed"][b] = int(n.strip())
-        rec["unsafe"].append(f"branch {b}: {n.strip()} commit(s) on no remote"
+        rec["unsafe"].append(f"branch {b}: {n.strip()} commit(s) on no server remote"
                              + (" (the GitHub repo is archived)" if rec["archived"] else ""))
+    if others:
+        rc, n = git(path, "rev-list", "--count", *others, "--not", *not_on, "--")
+        if rc != 0 or int(n.strip() or 0) > 0:
+            rec["unsafe"].append(f"tags, notes or other refs hold {n.strip() or '?'} commit(s) on no server remote")
+    if kind != "worktree" and servers:
+        _, local_tags = git(path, "tag", "--list")
+        if local_tags.strip():
+            if a.no_fetch:
+                rec["notes"].append("tag check skipped (--no-fetch)")
+            else:
+                rc, rt = git(path, "ls-remote", "--tags", servers[0], timeout=120)
+                remote_tags = {l.split("refs/tags/", 1)[1].replace("^{}", "")
+                               for l in rt.splitlines() if "refs/tags/" in l}
+                missing = [t for t in local_tags.split() if t not in remote_tags]
+                if rc != 0:
+                    rec["unsafe"].append("cannot list the remote's tags")
+                elif missing:
+                    rec["unsafe"].append(f"{len(missing)} tag(s) not on the remote: {', '.join(missing[:5])}")
 
-    if git(path, "symbolic-ref", "--quiet", "HEAD")[0] != 0:
-        rc, n = git(path, "rev-list", "--count", "HEAD", "--not", "--remotes", "--branches", "--")
-        if rc == 0 and int(n.strip() or 0) > 0:
-            rec["unsafe"].append(f"detached HEAD: {n.strip()} commit(s) on no branch or remote")
+    if kind != "worktree" and os.path.isdir(os.path.join(common, "lfs")):
+        if not shutil.which("git-lfs"):
+            rec["unsafe"].append("an LFS store is here but git-lfs is not installed: cannot check it")
+        elif servers:
+            rc, out = git(path, "lfs", "push", "--dry-run", servers[0], "--all", timeout=300)
+            if rc != 0:
+                rec["unsafe"].append("cannot check LFS objects (git lfs push --dry-run failed)")
+            elif out.strip():
+                rec["unsafe"].append(f"{len(out.splitlines())} LFS object(s) not on the remote")
 
-    feature = [b for b in branches if b != default]
-    if feature and slug and ctx.gh:
-        for b in feature:
-            prs = ctx.gh_json(["pr", "list", "-R", slug, "--head", b, "--state", "open",
-                               "--json", "number", "--limit", "5"]) or []
-            if prs:
-                rec["active"].append(f"branch {b} has open PR #{prs[0]['number']}")
-    elif feature and kind == "worktree" and not a.no_gh:
-        rec["active"].append("cannot check for an open PR (gh missing, not signed in, or not GitHub)")
+    feature = [b for b in branches if b != default_branch(path)]
+    if feature and not a.no_gh:
+        if not (slug and ctx.gh):
+            rec["active"].append("cannot check for open PRs (gh missing, not signed in, or not GitHub)")
+        else:
+            for b in feature:
+                prs = ctx.gh_json(["pr", "list", "-R", slug, "--head", b, "--state", "open",
+                                   "--json", "number", "--limit", "5"])
+                if prs is None:
+                    rec["active"].append(f"branch {b}: cannot check for an open PR (gh error)")
+                elif prs:
+                    rec["active"].append(f"branch {b} has open PR #{prs[0]['number']}")
 
     if kind != "worktree":
         _, s = git(path, "stash", "list")
         if s.strip():
             rec["unsafe"].append(f"{len(s.splitlines())} stash(es)")
-        linked = [w["worktree"] for w in worktrees(path)[1:]]
+        linked = [w["worktree"] for w in worktrees(path)[1:] if "worktree" in w]
         if linked:
             rec["worktrees"] = linked
             rec["unsafe"].append(f"{len(linked)} linked worktree(s): remove them first")
+
+    hidden = hidden_changes(path)
+    if hidden:
+        rec["unsafe"].append(f"{hidden} hidden change(s): skip-worktree or assume-unchanged files differ from git")
 
     _, st = git(path, "status", "--porcelain=v1", "-z", "--ignored", "--untracked-files=normal")
     fields = iter(st.split("\0"))
@@ -332,31 +433,25 @@ def inspect(path, kind, ctx, nested=()):
         if code[0] in "RC":
             next(fields, None)  # the rename's source path
         full = os.path.join(path, rel)
-        holds_nested = any(n == full.rstrip("/") or n.startswith(full.rstrip("/") + "/") for n in nested)
+        holds = any(n == full.rstrip("/") or n.startswith(full.rstrip("/") + "/") for n in nested)
         if code == "!!":
-            if regenerable(rel):
+            if not holds and regenerable(rel):
                 if rel.endswith("/"):
                     rec["deps"].append(full.rstrip("/"))
-            elif holds_nested:
-                rec["local_only"] += loose_files(path, full, nested)
-            else:
-                rec["local_only"].append(rel)
+                continue
+            files, capped, newest = walk_files(path, full, nested, skip_regen=True)
+            rec["local_only"] += [rel] if capped else files
         elif code == "??":
-            if holds_nested:
-                rec["untracked"] += loose_files(path, full, nested)
-            elif not regenerable(rel):
-                rec["untracked"].append(rel)
+            files, capped, newest = walk_files(path, full, nested, skip_regen=False)
+            rec["untracked"] += [rel] if capped else files
         else:
             dirty.append(rel)
-    for rel in dirty + rec["untracked"]:
-        try:
-            stamps.append(os.lstat(os.path.join(path, rel)).st_mtime)
-        except OSError:
-            pass
+            newest = os.lstat(full).st_mtime if os.path.lexists(full) else 0
+        stamps.append(newest)
     if dirty:
         rec["unsafe"].append(f"{len(dirty)} uncommitted change(s) to tracked files")
     if rec["untracked"]:
-        rec["unsafe"].append(f"{len(rec['untracked'])} untracked file(s) not in git")
+        rec["unsafe"].append(f"{len(rec['untracked'])} untracked path(s) not in git")
 
     idle_h = (time.time() - max(stamps)) / 3600 if stamps else None
     rec["idle_days"] = round(idle_h / 24, 1) if idle_h is not None else None
@@ -370,9 +465,14 @@ def inspect(path, kind, ctx, nested=()):
             rec["keep"].append(marker)
         if expired:
             rec["notes"].append(expired)
+        fac = os.path.join(path, ".factory")
+        if os.path.isdir(fac) and os.listdir(fac):
+            rec["keep"].append("holds orchestrator state in .factory/: its orchestrator retires it")
         if idle_h is not None and idle_h < a.keep_days * 24:
             rec["keep"].append(f"used {idle_h / 24:.0f} day(s) ago (under --keep-days {a.keep_days:g})")
-        if info and not info.get("isArchived") and info.get("pushedAt"):
+        if slug and not a.no_gh and not info:
+            rec["keep"].append("cannot check the last GitHub push (gh missing or failed)")
+        elif info and not info.get("isArchived") and info.get("pushedAt"):
             pushed = datetime.datetime.strptime(info["pushedAt"], "%Y-%m-%dT%H:%M:%SZ").replace(
                 tzinfo=datetime.timezone.utc)
             days = (datetime.datetime.now(datetime.timezone.utc) - pushed).total_seconds() / 86400
@@ -405,18 +505,25 @@ def inspect_tree(path, kind, ctx, parent=None):
         if sub[0]["verdict"] == "keep":
             rec["keep"].append(f"nested repo {rel} is an ongoing project")
         if sub[0]["unsafe"]:
-            rec["unsafe"].append(f"nested repo {rel} holds work on no remote")
+            rec["unsafe"].append(f"nested repo {rel} holds work on no server remote")
         rec["local_only"] += [os.path.join(rel, f) for f in sub[0]["local_only"]]
     rec["verdict"] = decide(rec)
     return out
 
 
-def finish(it):
-    """Sizes, filled in last so that du does not slow the git checks."""
-    if it.get("path") and os.path.exists(it["path"]) and "size_mb" not in it:
+def finish(it, sizes=True):
+    """Sizes last, so that du does not slow the git checks. A parent's size
+    includes its nested repos: do not add both to a total."""
+    if sizes and it.get("path") and os.path.exists(it["path"]) and "size_mb" not in it:
         it["size_mb"] = size_mb(it["path"])
-    it["deps"] = [d if isinstance(d, dict) else {"path": d, "size_mb": size_mb(d)} for d in it.get("deps", [])]
+    it["deps"] = [d if isinstance(d, dict) else {"path": d, "size_mb": size_mb(d) if sizes else None}
+                  for d in it.get("deps", [])]
     return it
+
+
+def unmounted(path):
+    vol = re.match(r"^(/Volumes/[^/]+)", path)
+    return bool(vol) and not os.path.ismount(vol.group(1))
 
 
 def plugin_items(others):
@@ -440,11 +547,9 @@ def plugin_items(others):
             pp = e.get("projectPath")
             if not pp or os.path.exists(pp):
                 continue
-            vol = re.match(r"^(/Volumes/[^/]+)", pp)
-            unmounted = bool(vol) and not os.path.ismount(vol.group(1))
             items.append({"kind": "install-record", "plugin": pid, "scope": e.get("scope"), "projectPath": pp,
-                          "verdict": "keep" if unmounted else "report-only",
-                          "notes": ["the drive is not mounted: the folder may still exist" if unmounted
+                          "verdict": "keep" if unmounted(pp) else "report-only",
+                          "notes": ["the drive is not mounted: the folder may still exist" if unmounted(pp)
                                     else "the folder is gone; the record is harmless"]})
     return items
 
@@ -452,11 +557,11 @@ def plugin_items(others):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", action="append", help="folder to scan (repeatable); default ~/dev and ~/.factory")
-    ap.add_argument("--only", help="inspect this one path again: the re-check right before acting on it")
+    ap.add_argument("--only", help="re-check one clone or worktree (its top folder) right before acting on it")
     ap.add_argument("--active-hours", type=float, default=24, help="changed this recently: active (default 24)")
-    ap.add_argument("--keep-days", type=float, default=30, help="used or pushed this recently: an ongoing project (default 30)")
+    ap.add_argument("--keep-days", type=float, default=30, help="used or pushed this recently: ongoing (default 30)")
     ap.add_argument("--no-fetch", action="store_true", help="skip git fetch --prune")
-    ap.add_argument("--no-gh", action="store_true", help="skip GitHub checks (merged and open PRs, archived, last push)")
+    ap.add_argument("--no-gh", action="store_true", help="skip GitHub checks (PRs, archived, last push)")
     ap.add_argument("--no-plugins", action="store_true", help="skip the Claude Code plugin cache check")
     a = ap.parse_args()
     ctx = Ctx(a)
@@ -465,18 +570,26 @@ def main():
               "gh": bool(ctx.gh), "other_claude_sessions": others, "items": []}
 
     if a.only:
-        p = os.path.abspath(os.path.expanduser(a.only))
+        p = os.path.realpath(os.path.expanduser(a.only))
+        rc, top = git(p, "rev-parse", "--show-toplevel")
+        if rc != 0 or os.path.realpath(top.strip()) != p:
+            print(json.dumps({"error": f"{p} is not the top folder of a clone or worktree: "
+                                       "re-check its clone instead"}))
+            sys.exit(2)
         if not is_linked_worktree(p):
             rec = inspect_tree(p, "clone", ctx)[0]
         else:
             rec = inspect(p, "worktree", ctx)
-            _, common = git(p, "rev-parse", "--path-format=absolute", "--git-common-dir")
-            rec["main"] = os.path.dirname(common.strip().rstrip("/"))
-            if any("locked" in w for w in worktrees(rec["main"])
-                   if os.path.realpath(w.get("worktree", "")) == os.path.realpath(p)):
+            wl = worktrees(p)
+            rec["main"] = wl[0].get("worktree") if wl else None
+            if any("locked" in w for w in wl if os.path.realpath(w.get("worktree", "")) == p):
                 rec["active"].append("worktree is locked (git worktree lock)")
-            rec["verdict"] = decide(rec)
-        report["items"] = [finish(rec)]
+        ctx._busy = False  # a fresh process snapshot, taken last
+        busy = in_use(p, ctx)
+        if busy and busy not in rec["active"]:
+            rec["active"].append(busy)
+        rec["verdict"] = decide(rec)
+        report["items"] = [finish(rec, sizes=False)]
         print(json.dumps(report, indent=1))
         return
 
@@ -488,15 +601,16 @@ def main():
             if os.path.realpath(repo) in seen or is_linked_worktree(repo):
                 continue
             seen.add(os.path.realpath(repo))
-            recs = inspect_tree(repo, "clone", ctx)
-            report["items"] += recs
-            for w in worktrees(repo)[1:]:
-                wts.append((w, repo))
+            report["items"] += inspect_tree(repo, "clone", ctx)
+            wts += [(w, repo) for w in worktrees(repo)[1:] if "worktree" in w]
     for w, main_repo in wts:
         p = w["worktree"]
         if "prunable" in w or not os.path.isdir(p):
-            report["items"].append({"path": p, "kind": "worktree", "main": main_repo, "verdict": "safe",
-                                    "notes": ["the folder is gone; `git worktree prune` drops the record"]})
+            gone = not unmounted(p)
+            report["items"].append({"path": p, "kind": "worktree", "main": main_repo,
+                                    "verdict": "safe" if gone else "keep",
+                                    "notes": ["the folder is gone; `git worktree prune` drops the record" if gone
+                                              else "the drive is not mounted: do not prune"]})
             continue
         rec = inspect(p, "worktree", ctx)
         rec["main"] = main_repo

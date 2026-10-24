@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Self-check for inventory.py: throwaway repos, one per case, against a local bare remote.
-Offline. Run: python3 test_inventory.py"""
+"""Self-check for inventory.py: throwaway repos, one per case. Offline: the server
+remote https://github.com/test/repo.git is rewritten (url.insteadOf) to a local
+bare repo, so it counts as a server while a plain folder remote does not.
+Everything is aged two years, then the fresh cases are made. Run: python3 test_inventory.py"""
 import datetime
 import json
 import os
@@ -8,92 +10,157 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+URL = "https://github.com/test/repo.git"
+OLD = time.time() - 2 * 365 * 86400
 
 
 def sh(*cmd, cwd=None):
     subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True)
 
 
-def clone(remote, path):
-    sh("git", "clone", "-q", remote, path)
-    sh("git", "-C", path, "config", "user.email", "t@example.com")
-    sh("git", "-C", path, "config", "user.name", "t")
+def write(path, text="x"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
 
 
-def commit(path, name, push=False, branch=None):
-    open(os.path.join(path, name), "w").write(name)
-    sh("git", "-C", path, "add", name)
-    sh("git", "-C", path, "commit", "-qm", name)
+def commit(repo, name, push=None):
+    write(os.path.join(repo, name), name)
+    sh("git", "-C", repo, "add", "--", name)
+    sh("git", "-C", repo, "commit", "-qm", name)
     if push:
-        sh("git", "-C", path, "push", "-q", "origin", branch or "HEAD")
+        sh("git", "-C", repo, "push", "-q", "origin", push)
+
+
+def exclude(repo, pattern):
+    with open(os.path.join(repo, ".git", "info", "exclude"), "a") as f:
+        f.write(pattern + "\n")
+
+
+def age(top):
+    for d, dirs, files in os.walk(top):
+        for n in dirs + files:
+            os.utime(os.path.join(d, n), (OLD, OLD), follow_symlinks=False)
 
 
 def inventory(*args):
-    out = subprocess.run([sys.executable, os.path.join(HERE, "inventory.py"), "--no-gh", "--no-plugins", *args],
-                         check=True, capture_output=True, text=True).stdout
-    return {os.path.realpath(i["path"]): i for i in json.loads(out)["items"]}
+    p = subprocess.run([sys.executable, os.path.join(HERE, "inventory.py"), "--no-gh", "--no-plugins", *args],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        return p.returncode, None
+    return 0, {os.path.realpath(i["path"]): i for i in json.loads(p.stdout)["items"]}
 
 
 def main():
     t = os.path.realpath(tempfile.mkdtemp(prefix="cleanup-test-"))
     remote, dev = os.path.join(t, "remote.git"), os.path.join(t, "dev")
-    os.makedirs(dev)
-    sh("git", "init", "-q", "--bare", "-b", "main", remote)
-    seed = os.path.join(t, "seed")
-    clone(remote, seed)
-    commit(seed, "README", push=True, branch="main")
-    p = {k: os.path.join(dev, k) for k in "ABCDEFGHIJKL"}
-    for k in p:
-        clone(remote, p[k])
-    commit(p["B"], "local-only-commit")
-    open(os.path.join(p["C"], "README"), "a").write("x")
-    sh("git", "-C", p["C"], "stash", "-q")
-    open(os.path.join(p["D"], "notes.txt"), "w").write("work")
-    for k, pat, f in (("E", ".env", ".env"), ("F", "node_modules/", "node_modules/x.js")):
-        open(os.path.join(p[k], ".git", "info", "exclude"), "a").write(pat + "\n")
-        os.makedirs(os.path.dirname(os.path.join(p[k], f)), exist_ok=True)
-        open(os.path.join(p[k], f), "w").write("x")
-    w1, w2 = os.path.join(dev, "wt1"), os.path.join(dev, "wt2")
-    sh("git", "-C", p["G"], "worktree", "add", "-q", "-b", "feat1", w1)
-    commit(w1, "feat1", push=True, branch="feat1")
-    sh("git", "-C", p["G"], "worktree", "add", "-q", "-b", "feat2", w2)
-    open(os.path.join(w2, "README"), "a").write("dirty")
-    open(os.path.join(p["H"], ".git", "info", "exclude"), "a").write("apps/\n")
-    inner = os.path.join(p["H"], "apps", "inner")
-    clone(remote, inner)
-    commit(inner, "inner-commit")
-    open(os.path.join(p["I"], ".git", "index.lock"), "w").close()
-    busy = subprocess.Popen(["sleep", "120"], cwd=p["J"])
-    future = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
-    sh("git", "-C", p["K"], "config", "cleanup.keepUntil", future)
-    sh("git", "-C", p["K"], "config", "cleanup.keepReason", "client work")
-    sh("git", "-C", p["L"], "config", "cleanup.keepUntil", "2001-01-01")
+    cfg = os.path.join(t, "gitconfig")
+    write(cfg, f'[user]\n\tname = t\n\temail = t@example.com\n[init]\n\tdefaultBranch = main\n'
+               f'[url "{remote}"]\n\tinsteadOf = {URL}\n')
+    os.environ.update(GIT_CONFIG_GLOBAL=cfg, GIT_CONFIG_NOSYSTEM="1",
+                      GIT_AUTHOR_DATE="2024-01-01T00:00:00", GIT_COMMITTER_DATE="2024-01-01T00:00:00")
+    procs = []
     try:
-        got = inventory("--root", dev, "--active-hours", "0", "--keep-days", "0")
-        want = {"A": "safe", "B": "unsafe", "C": "unsafe", "D": "unsafe", "E": "backup-first",
-                "F": "safe", "G": "unsafe", "H": "unsafe", "I": "active", "J": "active", "K": "keep", "L": "safe"}
-        bad = [f"{k}: want {v}, got {got[p[k]]['verdict']}" for k, v in want.items() if got[p[k]]["verdict"] != v]
-        for path, v in ((w1, "safe"), (w2, "unsafe"), (inner, "unsafe")):
-            if got[path]["verdict"] != v:
-                bad.append(f"{path}: want {v}, got {got[path]['verdict']}")
-        assert got[w1]["kind"] == "worktree" and got[inner]["kind"] == "nested", "worktree/nested kinds"
-        assert got[p["E"]]["local_only"] == [".env"], got[p["E"]]["local_only"]
-        assert [d["path"] for d in got[p["F"]]["deps"]] == [os.path.join(p["F"], "node_modules")], got[p["F"]]["deps"]
-        assert any("expired" in n for n in got[p["L"]]["notes"]), got[p["L"]]["notes"]
-        assert got[p["B"]]["unpushed"] == {"main": 1}, got[p["B"]]["unpushed"]
-        # Defaults: a clone changed seconds ago is active; with --active-hours 0 it is an ongoing project.
-        if inventory("--only", p["A"])[os.path.realpath(p["A"])]["verdict"] != "active":
-            bad.append("A with default --active-hours: want active")
-        if inventory("--only", p["A"], "--active-hours", "0")[os.path.realpath(p["A"])]["verdict"] != "keep":
-            bad.append("A with default --keep-days: want keep")
-        if inventory("--only", w1, "--active-hours", "0")[w1]["verdict"] != "safe":
+        sh("git", "init", "-q", "--bare", remote)
+        seed = os.path.join(t, "seed")
+        sh("git", "clone", "-q", URL, seed)
+        commit(seed, "README", push="main")
+        p = {k: os.path.join(dev, k) for k in "ABCDEFGHIJKLMNPQRSUV"}
+        for k in p:
+            sh("git", "clone", "-q", URL, p[k])
+        sh("git", "clone", "-q", remote, os.path.join(dev, "O"))  # remote is a folder on this disk
+        p["O"] = os.path.join(dev, "O")
+
+        commit(p["B"], "unpushed")
+        write(os.path.join(p["C"], "README"), "changed")
+        sh("git", "-C", p["C"], "stash", "-q")
+        write(os.path.join(p["D"], "notes.txt"), "work")
+        exclude(p["E"], ".env")
+        write(os.path.join(p["E"], ".env"), "KEY=1")
+        exclude(p["F"], "node_modules/")
+        write(os.path.join(p["F"], "node_modules", "x.js"))
+        w1, w2 = os.path.join(dev, "wt1"), os.path.join(dev, "wt2")
+        sh("git", "-C", p["G"], "worktree", "add", "-q", "-b", "feat1", w1)
+        commit(w1, "feat1", push="feat1")
+        sh("git", "-C", p["G"], "worktree", "add", "-q", "-b", "feat2", w2)
+        write(os.path.join(w2, "README"), "dirty")
+        exclude(p["H"], "apps/")
+        inner = os.path.join(p["H"], "apps", "inner")
+        sh("git", "clone", "-q", URL, inner)
+        commit(inner, "inner-commit")
+        future = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
+        sh("git", "-C", p["K"], "config", "cleanup.keepUntil", future)
+        sh("git", "-C", p["K"], "config", "cleanup.keepReason", "client work")
+        sh("git", "-C", p["L"], "config", "cleanup.keepUntil", "2001-01-01")
+        write(os.path.join(p["M"], "src", "build", "feature.py"), "work")  # untracked, build-named folder
+        commit(p["N"], "tagged")
+        sh("git", "-C", p["N"], "tag", "t1")
+        sh("git", "-C", p["N"], "reset", "-q", "--hard", "origin/main")  # the commit lives on the tag only
+        sh("git", "-C", p["P"], "update-index", "--skip-worktree", "README")
+        write(os.path.join(p["P"], "README"), "hidden edit")
+        exclude(p["Q"], "data/")
+        sh("git", "clone", "-q", URL, os.path.join(p["Q"], "data", "repo"))
+        for i in range(300):
+            write(os.path.join(p["Q"], "data", f"f{i}.csv"))
+        write(os.path.join(p["R"], ".factory", "reservations.json"), "{}")
+        exclude(p["R"], ".factory/")
+        exclude(p["S"], ".env")
+        exclude(p["U"], "out/")
+        deep = os.path.join(p["U"], "out", "a", "b", "c", "deep")
+        sh("git", "clone", "-q", URL, deep)
+        commit(deep, "deep-commit")
+        write(os.path.join(p["V"], "log.txt"), "open")
+
+        age(dev)
+        # Fresh cases, after aging.
+        a2 = os.path.join(dev, "A2")
+        sh("git", "clone", "-q", URL, a2)
+        write(os.path.join(p["S"], ".env"), "written now")
+        write(os.path.join(p["I"], ".git", "index.lock"), "")
+        procs.append(subprocess.Popen(["sleep", "300"], cwd=p["J"]))
+        procs.append(subprocess.Popen(["tail", "-f", os.path.join(p["V"], "log.txt")], cwd="/",
+                                      stdout=subprocess.DEVNULL))
+        time.sleep(0.5)
+
+        rc, got = inventory("--root", dev)
+        assert rc == 0, "inventory failed"
+        want = {"A": "safe", "B": "unsafe", "C": "unsafe", "D": "unsafe", "E": "backup-first", "F": "safe",
+                "G": "unsafe", "H": "unsafe", "I": "active", "J": "active", "K": "keep", "L": "safe",
+                "M": "unsafe", "N": "unsafe", "O": "unsafe", "P": "unsafe", "Q": "backup-first", "R": "keep",
+                "S": "active", "U": "unsafe", "V": "active", "A2": "active"}
+        p["A2"] = a2
+        bad = [f"{k}: want {v}, got {got[p[k]]['verdict']} {got[p[k]]['active'] + got[p[k]]['unsafe']}"
+               for k, v in want.items() if got[p[k]]["verdict"] != v]
+        for path, v in ((w1, "safe"), (w2, "unsafe"), (inner, "unsafe"), (deep, "unsafe")):
+            if got.get(path, {}).get("verdict") != v:
+                bad.append(f"{path}: want {v}, got {got.get(path, {}).get('verdict')}")
+        checks = [
+            (got[w1]["kind"] == "worktree" and got[inner]["kind"] == "nested", "worktree and nested kinds"),
+            (got[p["E"]]["local_only"] == [".env"], f"E local_only {got[p['E']]['local_only']}"),
+            ([d["path"] for d in got[p["F"]]["deps"]] == [os.path.join(p["F"], "node_modules")], "F deps"),
+            (any("expired" in n for n in got[p["L"]]["notes"]), "L expired note"),
+            (got[p["B"]]["unpushed"] == {"main": 1}, f"B unpushed {got[p['B']]['unpushed']}"),
+            (got[p["M"]]["untracked"] == ["src/build/feature.py"], f"M untracked {got[p['M']]['untracked']}"),
+            (any("tag" in u for u in got[p["N"]]["unsafe"]), "N tag reason"),
+            (any("folder on this disk" in u for u in got[p["O"]]["unsafe"]), "O local remote reason"),
+            (any("hidden change" in u for u in got[p["P"]]["unsafe"]), "P hidden change reason"),
+            ("data/" in got[p["Q"]]["local_only"], f"Q capped folder {got[p['Q']]['local_only'][:3]}"),
+        ]
+        bad += [msg for ok, msg in checks if not ok]
+        rc, _ = inventory("--only", os.path.join(p["F"], "node_modules"))
+        if rc != 2:
+            bad.append(f"--only on a deps folder: want exit 2, got {rc}")
+        rc, one = inventory("--only", w1)
+        if not one or one[w1]["verdict"] != "safe":
             bad.append("--only wt1: want safe")
         assert not bad, "\n".join(bad)
-        print("ok: 18 checks")
+        print(f"ok: {len(want) + 4 + len(checks) + 2} checks")
     finally:
-        busy.kill()
+        for pr in procs:
+            pr.kill()
         shutil.rmtree(t, ignore_errors=True)
 
 

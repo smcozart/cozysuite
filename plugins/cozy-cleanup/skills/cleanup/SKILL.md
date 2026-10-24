@@ -6,41 +6,44 @@ disable-model-invocation: true
 
 # Clean up this machine
 
-GitHub is the source of truth. A local copy can go when everything in it is on
-GitHub or in a backup, and the project is not ongoing. Other agents may work at
-the same time: never touch a folder that they use or that is in flight.
+GitHub is the source of truth. A local copy can go when everything in it is on a
+server remote or in a backup, and the project is not ongoing. Other agents may
+work at the same time: never touch a folder that they use or that is in flight.
 
 The script `scripts/inventory.py` (in this skill's base directory) does the
-checks. It only reads; its one write is `git fetch --prune`. Run it with
-`python3`. `--help` lists the options.
+checks. It only reads; its one write is `git fetch --prune` on clones that are
+not active. Run it with `python3`. `--help` lists the options.
 
 ## 1. Lock and read
 
-1. `mkdir ~/.claude/cleanup.lock`. If that fails, another cleanup is running:
-   stop and say so. Remove the lock when you finish or stop, on every path.
+1. `mkdir ~/.claude/cleanup.lock && echo "pid $$ $(date)" > ~/.claude/cleanup.lock/owner`.
+   If `mkdir` fails, another cleanup runs or one crashed: show the `owner`
+   file and stop. Only the developer removes a lock. Remove your own lock
+   when you finish or stop, on every path.
 2. Run `python3 <base>/scripts/inventory.py`. It scans `~/dev` and
    `~/.factory`. Add `--root <folder>` for each other place the developer
-   names. Use the defaults (`--active-hours 24`, `--keep-days 30`) unless the
-   developer gives other values.
+   names. Keep the defaults (`--active-hours 24`, `--keep-days 30`) unless the
+   developer gives other values. Never lower them to get an item through.
 3. Read the JSON. Each item has a `verdict` and its reasons.
 
 | Verdict | Means | Proposed action |
 |---|---|---|
-| `active` | A process or agent works in it, a git operation or an open PR is in flight, the worktree is locked, or it changed within `--active-hours`. | None. List it only. |
-| `keep` | An ongoing project: a keep marker, use on this machine within `--keep-days`, or a push to GitHub within `--keep-days`. | None. If it also has `unsafe` reasons, offer to push that work (section 3) and nothing else. |
-| `unsafe` | Something is on no remote: unpushed commits, stashes, uncommitted or untracked files, linked worktrees, a nested repo with such work. Or the state is unknown: no remote, a failed fetch. | Make it safe (section 3), or leave it. |
-| `backup-first` | All git work is on a remote. Files git ignores remain (`local_only`): `.env`, local databases, notes. | Back them up (section 3), then delete. |
-| `safe` | Everything is on a remote. A branch that is on no remote but was merged as a PR at that exact tip counts as on GitHub (see `notes`). | Delete. |
+| `active` | A process or agent has files or its working folder in it, a git operation or an open PR is in flight, the worktree is locked, it changed within `--active-hours`, or one of these cannot be checked. | None. List it only. |
+| `keep` | An ongoing project: a keep marker, use within `--keep-days`, a GitHub push within `--keep-days`, `.factory/` orchestrator state, or the last push cannot be checked. | None. If it also has `unsafe` reasons, offer to push that work (section 3) and nothing else. |
+| `unsafe` | Something is on no server remote: unpushed commits (on branches, tags or notes), tags or LFS objects not on the remote, stashes, uncommitted, hidden or untracked changes, linked worktrees, a nested repo with such work. Or the state is unknown. A remote that is a folder on this disk does not count. | Make it safe (section 3), or leave it. |
+| `backup-first` | All git work is on a server remote. Files git ignores remain (`local_only`): `.env`, local databases, notes. | Back them up (section 3), then delete. |
+| `safe` | Everything is on a server remote. A branch on no remote that was merged as a PR at that exact tip counts (see `notes`). | Delete. |
 
 Also in the JSON:
-- `deps`: build output inside a clone (`node_modules`, `vendor`, ...). For a
-  clone that stays, offer to delete only these.
-- `plugin-cache`: caches of Claude Code marketplaces that nothing uses.
-  Delete only when `other_claude_sessions` is 0, because a running session may
-  still read its files.
+- `deps`: build output inside a clone (`node_modules`, `vendor`, ...). Offer to
+  delete only these for a clone that stays, and only when that clone has no
+  `active` reasons.
+- `plugin-cache`: caches of Claude Code marketplaces that nothing uses. Delete
+  only while `other_claude_sessions` is 0: a running session may still read
+  them.
 - `install-record`: plugin records for folders that are gone. They are
   harmless. List them; never edit `~/.claude/plugins/installed_plugins.json`.
-  A record on a drive that is not mounted is not stale.
+- `size_mb` of a clone includes its nested repos. Do not add both to a total.
 
 ## 2. Show the plan and wait
 
@@ -48,39 +51,51 @@ One table: path, kind, size, verdict, the reasons in a few words, the proposed
 action. Then the total space the plan frees. Ask once. The developer approves,
 removes or adds items. Run nothing that changes state before they say yes.
 
-- A clone stays unless its verdict is `safe` or `backup-first`. A clone the
-  developer names goes only after the same checks pass.
+- A clone goes only if its verdict is `safe` or `backup-first`, also when the
+  developer names it.
 - Worktrees and nested repos inside a clone that stays are their own items.
 - Never delete or edit a repo's `.factory/` state (reservations, logs). Its
-  orchestrator retires that state. A clone inside `.factory/` is a nested repo,
-  with the same checks.
+  orchestrator retires that state.
 - To keep a project that the checks would remove, mark it as ongoing:
   `git -C <repo> config cleanup.keepUntil <YYYY-MM-DD>` and
-  `git -C <repo> config cleanup.keepReason "<why>"`. With no date it stays
-  until the marker is removed (`git config --unset cleanup.keepUntil`). The
-  marker lives in that clone's `.git/config`: local, never committed.
+  `git -C <repo> config cleanup.keepReason "<why>"`. With only a reason (or
+  `cleanup.keep true`), it stays until the marker is removed. The marker is in
+  that clone's `.git/config`: local, never committed.
 
 ## 3. Make an approved item safe
 
-- Unpushed branch: `git -C <repo> push origin <branch>`. Never `--force`,
-  never `--no-verify`. If the GitHub repo is archived, ask the developer;
-  unarchive, push and archive again only on their yes.
-- Uncommitted or untracked work: commit it on a new branch
-  `backup/cleanup-<YYYY-MM-DD>` and push that branch. If a hook fails, do not
-  bypass it: back the files up (next item) and say why.
-- Local-only files and anything a hook blocked:
-  `(umask 077; tar -czf ~/.claude/backups/cleanup-<YYYY-MM-DD>/<name>.tgz -C <repo> <paths>)`,
-  then `tar -tzf` and check the file count. Never push these files.
-- A stash: ask the developer. Never drop it.
+Backups go to `~/.claude/backups/cleanup-<YYYY-MM-DD>/`. Make the folder with
+`(umask 077; mkdir -p <folder>)`.
 
-Then run `inventory.py --only <path>` again. Continue only if it is now `safe`
-or `backup-first` with every `local_only` path in a backup.
+- Unpushed commits on a branch: `git -C <repo> push origin <branch>`. A tag:
+  `git -C <repo> push origin <tag>`. Never `--force`, never `--no-verify`. If
+  the GitHub repo is archived, ask the developer; unarchive, push and archive
+  again only on their yes.
+- Untracked or uncommitted files, and hidden changes: back them up, do not
+  commit them by default. `(umask 077; tar -czf <folder>/<name>.tgz -C <repo> <paths>)`;
+  for tracked changes add `git -C <repo> diff HEAD > <folder>/<name>.patch`.
+  Push them to a `backup/cleanup-<YYYY-MM-DD>` branch instead only when all
+  three hold: the developer names the files, `visibility` is `PRIVATE`, and
+  `grep -nE '(sk-|ghp_|github_pat_|xox[bpa]-|AKIA|dapi)[A-Za-z0-9_-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY'`
+  finds nothing in them. If a hook fails, do not bypass it: back them up.
+- Local-only files: the same `tar`, with every `local_only` path. Never push
+  them.
+- A stash: ask the developer. Never drop it.
+- After each `tar`, run `tar -tzf` and check that every path is in it.
+
+An item that you committed or that changed in this step now looks recent: do
+not delete it in this run. It goes in a later run, after `--active-hours`.
+An item that you only pushed (existing commits) or backed up can continue.
 
 ## 4. Delete, one item at a time
 
-Right before each item, run `inventory.py --only <path>` (add `--active-hours`
-or `--keep-days` if the developer gave other values). If the verdict is worse
-than in the plan, skip the item and report it. Then:
+Right before each item, run `inventory.py --only <path>` with the same options
+(for `deps`, `--only` the clone that holds them). Continue only if:
+- the verdict is no worse than in the plan, and
+- for `backup-first`, every `local_only` path is in the backup (`tar -tzf`
+  lists it, or for a folder its contents). A new path: back it up first.
+
+Otherwise skip the item and report it. Then:
 
 - Worktree: `git -C <main> worktree remove <path>` (never `--force`; `main` is
   in the JSON). Delete its branch with `git -C <main> branch -d <branch>`. Use
@@ -89,15 +104,20 @@ than in the plan, skip the item and report it. Then:
 - Clone or nested repo: `rm -rf '<absolute path>'`, one literal path per
   command.
 - Deps: `rm -rf '<absolute path>'` for each approved `deps` path.
-- Plugin cache: `rm -rf '<absolute path>'`, only while
-  `other_claude_sessions` is 0.
+- Plugin cache: `rm -rf '<absolute path>'`, only while `other_claude_sessions`
+  is 0.
 
-Never delete: a scan root, your home folder, a path outside the scan roots, the
-folder you work in, a path written with a variable or a glob. Never delete a
-remote branch. Never archive or unarchive a repo without the developer's yes.
+Never delete: a scan root, your home folder, a path outside the scan roots
+(except `plugin-cache` items under `~/.claude/plugins`), the folder you work
+in, a path written with a variable or a glob. Never delete a remote branch.
+Never archive or unarchive a repo without the developer's yes.
+
+The in-use check sees open files and working folders. An agent that only runs
+short commands in a folder (`git -C`) shows up as recent activity instead:
+that is why `--active-hours` stays at 24 or more while agents run.
 
 ## 5. Report
 
 What you deleted and the space freed (`df -h ~` before and after), what you
-pushed (repo, branch, sha), each backup (path, file count), and what you
+pushed (repo, branch or tag, sha), each backup (path, file count), and what you
 skipped, with the reason. Then remove `~/.claude/cleanup.lock`.
