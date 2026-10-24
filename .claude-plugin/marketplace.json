@@ -27,6 +27,12 @@
       "category": "preset"
     },
     {
+      "name": "cozy-cleanup",
+      "description": "/cozy-cleanup:cleanup frees disk space without losing work: proves what is on GitHub, backs up what git cannot hold, keeps ongoing projects, deletes only what you approve. Safe while other agents work.",
+      "source": "./plugins/cozy-cleanup",
+      "category": "maintenance"
+    },
+    {
       "name": "ai-sdlc",
       "description": "Ties agent work to source control: intent, GitHub issues, ADRs, a proof gate, and agent orchestration of issues. Needs mattpocock-skills (installed with it).",
       "source": {
