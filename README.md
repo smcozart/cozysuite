@@ -52,6 +52,11 @@ claude plugin marketplace update cozysuite
 claude plugin update <tool>@cozysuite --scope project
 ```
 
+For a preset, also run `claude plugin install <preset>@cozysuite --scope project`
+after the update: `update` moves the preset's version but does not install a
+member the new version added; `install` does, and adds it to `enabledPlugins`.
+Then commit `.claude/settings.json`.
+
 Then `/reload-plugins` or restart.
 
 ## Release a tool
