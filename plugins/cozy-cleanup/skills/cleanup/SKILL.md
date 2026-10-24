@@ -127,7 +127,10 @@ Never archive or unarchive a repo without the developer's yes.
 
 The in-use check sees open files and working folders. An agent that only runs
 short commands in a folder (`git -C`) shows up as recent activity instead:
-that is why `--active-hours` stays at 24 or more while agents run.
+that is why `--active-hours` stays at 24 or more while agents run. Activity
+comes from commits, the index, `HEAD` and changed files. A fetch or a
+ref-only change does not count, but any work it makes (a new commit, branch,
+tag or worktree) still fails the content checks.
 
 ## 5. Report
 
