@@ -1,0 +1,6 @@
+{
+  "name": "cozy-cleanup",
+  "version": "0.1.0",
+  "description": "/cozy-cleanup:cleanup frees disk space without losing work: it proves what is on GitHub, backs up what git cannot hold, keeps ongoing projects, and deletes only what you approve. Safe while other agents work.",
+  "author": { "name": "Sean Cozart" }
+}
