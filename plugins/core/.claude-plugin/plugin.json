@@ -1,7 +1,7 @@
 {
   "name": "core",
-  "version": "0.1.0",
-  "description": "cozysuite preset for any code repo under the workflow: ai-sdlc, ponytail, cozy-view, cozy-setup.",
+  "version": "0.2.0",
+  "description": "cozysuite preset for any code repo under the workflow: ai-sdlc, ponytail, cozy-view, cozy-setup, cozy-cleanup.",
   "author": { "name": "Sean Cozart" },
-  "dependencies": ["ai-sdlc", "ponytail", "cozy-view", "cozy-setup"]
+  "dependencies": ["ai-sdlc", "ponytail", "cozy-view", "cozy-setup", "cozy-cleanup"]
 }
