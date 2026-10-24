@@ -67,8 +67,13 @@ def main():
         sh("git", "init", "-q", "--bare", remote)
         seed = os.path.join(t, "seed")
         sh("git", "clone", "-q", URL, seed)
-        commit(seed, "README", push="main")
-        p = {k: os.path.join(dev, k) for k in "ABCDEFGHIJKLMNPQRSUV"}
+        commit(seed, "README")
+        commit(seed, "a.txt")
+        os.symlink("README", os.path.join(seed, "link"))
+        sh("git", "-C", seed, "add", "link")
+        sh("git", "-C", seed, "commit", "-qm", "link")
+        sh("git", "-C", seed, "push", "-q", "origin", "main")
+        p = {k: os.path.join(dev, k) for k in "ABCDEFGHIJKLMNPQRSUVWXY"}
         for k in p:
             sh("git", "clone", "-q", URL, p[k])
         sh("git", "clone", "-q", remote, os.path.join(dev, "O"))  # remote is a folder on this disk
@@ -113,6 +118,11 @@ def main():
         sh("git", "clone", "-q", URL, deep)
         commit(deep, "deep-commit")
         write(os.path.join(p["V"], "log.txt"), "open")
+        sh("git", "-C", p["W"], "update-index", "--skip-worktree", "a.txt", "README")
+        write(os.path.join(p["W"], "a.txt"), "hidden edit")
+        os.chmod(os.path.join(p["W"], "README"), 0)  # listed first and cannot be hashed: not clean
+        sh("git", "-C", p["X"], "update-index", "--skip-worktree", "link")  # unedited symlink: clean
+        sh("git", "-C", p["Y"], "tag", "t2")  # a tag name the remote does not have
 
         age(dev)
         # Fresh cases, after aging.
@@ -130,7 +140,8 @@ def main():
         want = {"A": "safe", "B": "unsafe", "C": "unsafe", "D": "unsafe", "E": "backup-first", "F": "safe",
                 "G": "unsafe", "H": "unsafe", "I": "active", "J": "active", "K": "keep", "L": "safe",
                 "M": "unsafe", "N": "unsafe", "O": "unsafe", "P": "unsafe", "Q": "backup-first", "R": "keep",
-                "S": "active", "U": "unsafe", "V": "active", "A2": "active"}
+                "S": "active", "U": "unsafe", "V": "active", "W": "unsafe", "X": "safe", "Y": "unsafe",
+                "A2": "active"}
         p["A2"] = a2
         bad = [f"{k}: want {v}, got {got[p[k]]['verdict']} {got[p[k]]['active'] + got[p[k]]['unsafe']}"
                for k, v in want.items() if got[p[k]]["verdict"] != v]
@@ -153,14 +164,19 @@ def main():
         rc, _ = inventory("--only", os.path.join(p["F"], "node_modules"))
         if rc != 2:
             bad.append(f"--only on a deps folder: want exit 2, got {rc}")
+        rc, one = inventory("--only", p["Y"], "--no-fetch")
+        if not one or one[os.path.realpath(p["Y"])]["verdict"] != "unsafe":
+            bad.append("--only Y --no-fetch: a local-only tag must stay unsafe")
         rc, one = inventory("--only", w1)
         if not one or one[w1]["verdict"] != "safe":
             bad.append("--only wt1: want safe")
         assert not bad, "\n".join(bad)
-        print(f"ok: {len(want) + 4 + len(checks) + 2} checks")
+        print(f"ok: {len(want) + 4 + len(checks) + 3} checks")
     finally:
         for pr in procs:
             pr.kill()
+        if "W" in locals().get("p", {}):
+            os.chmod(os.path.join(p["W"], "README"), 0o644)
         shutil.rmtree(t, ignore_errors=True)
 
 

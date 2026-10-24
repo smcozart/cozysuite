@@ -15,6 +15,7 @@ A copy on another folder of this disk never counts: only remotes on a server do.
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -83,8 +84,9 @@ def is_linked_worktree(d):
 
 def hosted(url):
     """A remote on a server, not another folder on this disk."""
-    return bool(re.match(r"^(https?|ssh|git)://[^/]+/", url or "")
-                or re.match(r"^[\w.-]+@[\w.-]+:", url or ""))
+    # ponytail: reads the raw URL; an insteadOf that maps it to a local mirror is not seen.
+    m = re.match(r"^(?:(?:https?|ssh|git)://(?:[^@/]+@)?([^/:]+)[^/]*/|[\w.-]+@([\w.-]+):)", url or "")
+    return bool(m) and (m.group(1) or m.group(2)) not in ("localhost", "127.0.0.1", "::1")
 
 
 def gh_slug(url):
@@ -137,7 +139,7 @@ def nested_repos(repo):
 def walk_files(repo, full, nested, skip_regen):
     """Files under a folder, outside nested repos (and outside build output when
     skip_regen). Returns (paths relative to repo, capped, newest mtime)."""
-    hits, newest = [], 0.0
+    hits, newest, capped, seen = [], 0.0, False, 0
     if os.path.isfile(full) or os.path.islink(full):
         try:
             newest = os.lstat(full).st_mtime
@@ -156,10 +158,14 @@ def walk_files(repo, full, nested, skip_regen):
                 newest = max(newest, os.lstat(fp).st_mtime)
             except OSError:
                 pass
-            hits.append(r)
-            if len(hits) >= CAP:
-                return hits, True, newest
-    return hits, False, newest
+            if len(hits) < CAP:
+                hits.append(r)
+            else:
+                capped = True
+            seen += 1
+            if seen >= 5000:  # ponytail: dating stops at 5000 files per folder
+                return hits, capped, newest
+    return hits, capped, newest
 
 
 def worktrees(repo):
@@ -181,7 +187,7 @@ def busy_paths():
     folders. None when lsof gives nothing: then nothing can be proved idle."""
     if not shutil.which("lsof"):
         return None
-    _, out = run(["lsof", "-w", "-Fn"], timeout=180)
+    _, out = run(["lsof", "-w", "-n", "-P", "-Fn"], timeout=180)
     paths = {os.path.realpath(l[1:]) for l in out.splitlines() if l.startswith("n/")}
     if not paths:
         return None
@@ -270,8 +276,13 @@ def default_branch(repo):
     return out.strip().split("/", 1)[-1] if rc == 0 else "main"
 
 
+def blob_sha(data):
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
 def hidden_changes(path):
-    """skip-worktree / assume-unchanged files whose content differs from git."""
+    """skip-worktree / assume-unchanged files whose content differs from git.
+    Returns the count, or -1 when some file cannot be checked."""
     _, out = git(path, "ls-files", "-v", "-z")
     flagged = [e[2:] for e in out.split("\0") if len(e) > 2 and (e[0] == "S" or e[0].islower())]
     on_disk = [f for f in flagged if os.path.lexists(os.path.join(path, f))][:2000]
@@ -283,9 +294,20 @@ def hidden_changes(path):
         if "\t" in e:
             meta, f = e.split("\t", 1)
             index[f] = meta.split()[1]
-    p = subprocess.run(["git", "--no-optional-locks", "-C", path, "hash-object", "--stdin-paths"],
-                       input="\n".join(on_disk), capture_output=True, text=True, env=ENV)
-    return sum(1 for f, h in zip(on_disk, p.stdout.split()) if index.get(f) != h)
+    _, fmt = git(path, "rev-parse", "--show-object-format")
+    links = [f for f in on_disk if os.path.islink(os.path.join(path, f))]
+    files = [f for f in on_disk if f not in links]
+    if links and fmt.strip() != "sha1":
+        return -1
+    disk = {f: blob_sha(os.fsencode(os.readlink(os.path.join(path, f)))) for f in links}
+    if files:
+        p = subprocess.run(["git", "--no-optional-locks", "-C", path, "hash-object", "--stdin-paths"],
+                           input="\n".join(files), capture_output=True, text=True, env=ENV)
+        hashes = p.stdout.split()
+        if p.returncode != 0 or len(hashes) != len(files):
+            return -1
+        disk.update(zip(files, hashes))
+    return sum(1 for f in on_disk if index.get(f) != disk[f])
 
 
 def inspect(path, kind, ctx, nested=()):
@@ -376,13 +398,16 @@ def inspect(path, kind, ctx, nested=()):
         _, local_tags = git(path, "tag", "--list")
         if local_tags.strip():
             if a.no_fetch:
-                rec["notes"].append("tag check skipped (--no-fetch)")
+                rec["unsafe"].append("local tags not checked against the remote (--no-fetch)")
             else:
-                rc, rt = git(path, "ls-remote", "--tags", servers[0], timeout=120)
-                remote_tags = {l.split("refs/tags/", 1)[1].replace("^{}", "")
-                               for l in rt.splitlines() if "refs/tags/" in l}
+                remote_tags, failed = set(), False
+                for n in servers:  # a fork's tags may live on upstream
+                    rc, rt = git(path, "ls-remote", "--tags", n, timeout=120)
+                    failed |= rc != 0
+                    remote_tags |= {l.split("refs/tags/", 1)[1].replace("^{}", "")
+                                    for l in rt.splitlines() if "refs/tags/" in l}
                 missing = [t for t in local_tags.split() if t not in remote_tags]
-                if rc != 0:
+                if missing and failed:
                     rec["unsafe"].append("cannot list the remote's tags")
                 elif missing:
                     rec["unsafe"].append(f"{len(missing)} tag(s) not on the remote: {', '.join(missing[:5])}")
@@ -420,7 +445,9 @@ def inspect(path, kind, ctx, nested=()):
             rec["unsafe"].append(f"{len(linked)} linked worktree(s): remove them first")
 
     hidden = hidden_changes(path)
-    if hidden:
+    if hidden < 0:
+        rec["unsafe"].append("cannot read some skip-worktree or assume-unchanged files: hidden changes unknown")
+    elif hidden:
         rec["unsafe"].append(f"{hidden} hidden change(s): skip-worktree or assume-unchanged files differ from git")
 
     _, st = git(path, "status", "--porcelain=v1", "-z", "--ignored", "--untracked-files=normal")

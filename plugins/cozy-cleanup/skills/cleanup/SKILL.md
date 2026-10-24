@@ -24,6 +24,9 @@ not active. Run it with `python3`. `--help` lists the options.
    `~/.factory`. Add `--root <folder>` for each other place the developer
    names. Keep the defaults (`--active-hours 24`, `--keep-days 30`) unless the
    developer gives other values. Never lower them to get an item through.
+   Never pass `--no-gh` or `--no-fetch`: they turn checks off and are for
+   tests only. If `gh` is `false` in the JSON, most items come out `keep` or
+   `active`: ask the developer to run `gh auth login`, then run again.
 3. Read the JSON. Each item has a `verdict` and its reasons.
 
 | Verdict | Means | Proposed action |
@@ -55,7 +58,7 @@ removes or adds items. Run nothing that changes state before they say yes.
   developer names it.
 - Worktrees and nested repos inside a clone that stays are their own items.
 - Never delete or edit a repo's `.factory/` state (reservations, logs). Its
-  orchestrator retires that state.
+  orchestrator retires that state. A clone that holds it is always `keep`.
 - To keep a project that the checks would remove, mark it as ongoing:
   `git -C <repo> config cleanup.keepUntil <YYYY-MM-DD>` and
   `git -C <repo> config cleanup.keepReason "<why>"`. With only a reason (or
@@ -83,9 +86,10 @@ Backups go to `~/.claude/backups/cleanup-<YYYY-MM-DD>/`. Make the folder with
 - A stash: ask the developer. Never drop it.
 - After each `tar`, run `tar -tzf` and check that every path is in it.
 
-An item that you committed or that changed in this step now looks recent: do
-not delete it in this run. It goes in a later run, after `--active-hours`.
-An item that you only pushed (existing commits) or backed up can continue.
+An item that you pushed or committed in this step now looks recent (a push
+also makes its GitHub repo look in use): do not delete it in this run. Tell
+the developer it goes in a later run. An item that you only backed up with
+`tar` can continue.
 
 ## 4. Delete, one item at a time
 
