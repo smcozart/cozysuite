@@ -20,9 +20,10 @@ not active. Run it with `python3`. `--help` lists the options.
    If `mkdir` fails, another cleanup runs or one crashed: show the `owner`
    file and stop. Only the developer removes a lock. Remove your own lock
    when you finish or stop, on every path.
-2. Run `python3 <base>/scripts/inventory.py`. It scans `~/dev` and
-   `~/.factory`. Add `--root <folder>` for each other place the developer
-   names. Keep the defaults (`--active-hours 24`, `--keep-days 30`) unless the
+2. Run `python3 <base>/scripts/inventory.py`. With no `--root` it scans
+   `~/dev` and `~/.factory`. `--root` replaces those defaults: to scan another
+   place as well, pass `--root ~/dev --root ~/.factory --root <folder>`; to
+   scan only the places the developer names, pass only those. Keep the defaults (`--active-hours 24`, `--keep-days 30`) unless the
    developer gives other values. Never lower them to get an item through.
    Never pass `--no-gh` or `--no-fetch`: they turn checks off and are for
    tests only. If `gh` is `false` in the JSON, most items come out `keep` or
@@ -74,9 +75,12 @@ Backups go to `~/.claude/backups/cleanup-<YYYY-MM-DD>/`. Make the folder with
   `git -C <repo> push origin <tag>`. Never `--force`, never `--no-verify`. If
   the GitHub repo is archived, ask the developer; unarchive, push and archive
   again only on their yes.
-- Untracked or uncommitted files, and hidden changes: back them up, do not
-  commit them by default. `(umask 077; tar -czf <folder>/<name>.tgz -C <repo> <paths>)`;
-  for tracked changes add `git -C <repo> diff HEAD > <folder>/<name>.patch`.
+- Untracked or uncommitted files: back them up, do not commit them by
+  default. One tarball per item with every `untracked` and `local_only` path:
+  `(umask 077; tar -czf <folder>/<name>.tgz -C <repo> <paths>)`; for
+  uncommitted changes to tracked files also
+  `git -C <repo> diff HEAD > <folder>/<name>.patch`. Hidden changes
+  (skip-worktree, assume-unchanged): ask the developer.
   Push them to a `backup/cleanup-<YYYY-MM-DD>` branch instead only when all
   three hold: the developer names the files, `visibility` is `PRIVATE`, and
   `grep -nE '(sk-|ghp_|github_pat_|xox[bpa]-|AKIA|dapi)[A-Za-z0-9_-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY'`
@@ -94,12 +98,17 @@ the developer it goes in a later run. An item that you only backed up with
 ## 4. Delete, one item at a time
 
 Right before each item, run `inventory.py --only <path>` with the same options
-(for `deps`, `--only` the clone that holds them). Continue only if:
-- the verdict is no worse than in the plan, and
-- for `backup-first`, every `local_only` path is in the backup (`tar -tzf`
-  lists it, or for a folder its contents). A new path: back it up first.
+(for `deps`, `--only` the clone that holds them; it must have no `active`
+reasons). Continue only if the re-check verdict is one of:
+- `safe`;
+- `backup-first`, and every `local_only` path is in the backup;
+- `unsafe`, and its only reasons are untracked paths or uncommitted changes
+  to tracked files, every `untracked` and `local_only` path is in the backup,
+  and the `.patch` exists when there are uncommitted changes.
 
-Otherwise skip the item and report it. Then:
+"In the backup" means `tar -tzf` lists the path (for a folder, its contents).
+A path that is not in it: back it up first. Anything else, or a verdict worse
+than in the plan: skip the item and report it. Then:
 
 - Worktree: `git -C <main> worktree remove <path>` (never `--force`; `main` is
   in the JSON). Delete its branch with `git -C <main> branch -d <branch>`. Use
