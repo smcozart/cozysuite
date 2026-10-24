@@ -1,6 +1,6 @@
 {
   "name": "cozysuite",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "/cozysuite:setup picks this project's tools from the cozysuite catalog and installs them at project scope.",
   "author": { "name": "Sean Cozart" },
   "homepage": "https://github.com/smcozart/cozysuite"

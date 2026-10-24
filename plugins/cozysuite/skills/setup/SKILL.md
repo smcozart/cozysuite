@@ -65,4 +65,7 @@ wants the workflow, the next step is "start a new project".
   and change only what the developer approves.
 - Upgrades are the developer's call: `claude plugin marketplace update
   cozysuite`, then `claude plugin update <tool>@cozysuite --scope project`,
-  then `/reload-plugins` (restart if a change does not show).
+  then `/reload-plugins` (restart if a change does not show). For a preset,
+  run `claude plugin install <preset>@cozysuite --scope project` after the
+  update: `update` does not install a member the new version added. Then
+  commit `.claude/settings.json`.
