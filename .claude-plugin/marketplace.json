@@ -69,8 +69,8 @@
       "source": {
         "source": "url",
         "url": "https://github.com/smcozart/cozy_view.git",
-        "ref": "cozy-view--v0.1.0",
-        "sha": "c42ec94520c18950330443700ed48a80ea294bb8"
+        "ref": "cozy-view--v0.1.1",
+        "sha": "7632a4d04e5fbe855fc81fd2233dd55d7dfd9db4"
       }
     },
     {
