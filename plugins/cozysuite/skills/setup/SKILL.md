@@ -12,15 +12,20 @@ after this.
 
 ## 1. Read
 
-- **The catalog is the only list.** Run `claude plugin marketplace update
-  cozysuite`, take its `installLocation` from `claude plugin marketplace list
-  --json`, and read `.claude-plugin/marketplace.json` there. An entry with
+- **The catalog is the only list.** Take cozysuite's `installLocation` from
+  `claude plugin marketplace list --json` and read
+  `.claude-plugin/marketplace.json` there. Reading changes nothing; the local
+  copy can be behind, so `claude plugin marketplace update cozysuite` is the
+  first command you run after the developer says yes. An entry with
   `"category": "preset"` is a preset; its members are the `dependencies` in the
   `.claude-plugin/plugin.json` under that entry's `source` path. Never
   recommend a tool that is not in the catalog.
 - **What this project has:** `.claude/settings.json` (`enabledPlugins`,
   `extraKnownMarketplaces`) and the entries of `claude plugin list --json`
   whose `projectPath` is this repo.
+- **Machine-wide tools:** `cozy-cleanup` cleans the whole machine. Recommend
+  it only when no other project has it (`claude plugin list --json`, any
+  `projectPath`).
 - **What would load twice:** entries of `claude plugin list --json` with
   `scope: user` whose plugin name is also in the catalog. Name them, and tell
   the developer to uninstall them (`claude plugin uninstall <id> --scope
@@ -43,6 +48,7 @@ before the developer says yes. Then:
 
 ```
 claude plugin marketplace add smcozart/cozysuite --scope project   # only when extraKnownMarketplaces has no cozysuite
+claude plugin marketplace update cozysuite
 claude plugin install <preset or tool>@cozysuite --scope project
 claude plugin uninstall <tool>@cozysuite --scope project           # a tool installed on its own
 claude plugin uninstall <preset>@cozysuite --scope project --prune -y   # drop a preset and the members only it needed
@@ -63,9 +69,8 @@ wants the workflow, the next step is "start a new project".
 - Never `--scope user`, and never edit `~/.claude/settings.json`.
 - On a repo already set up, show the current set beside the recommendation,
   and change only what the developer approves.
-- Upgrades are the developer's call: `claude plugin marketplace update
-  cozysuite`, then `claude plugin update <tool>@cozysuite --scope project`,
-  then `/reload-plugins` (restart if a change does not show). For a preset,
-  run `claude plugin install <preset>@cozysuite --scope project` after the
-  update: `update` does not install a member the new version added. Then
-  commit `.claude/settings.json`.
+- Upgrades are the developer's call. The steps are in `README.md` "Upgrade a
+  project" at the catalog's `installLocation`; follow them as written there.
+- Dependencies from another marketplace (`mattpocock-skills`, needed by
+  `ai-sdlc`) install at their latest version and are not pinned by this
+  catalog: name the version that installs.
