@@ -2,17 +2,22 @@
 """Self-check for inventory.py: throwaway repos, one per case. Offline: the server
 remote https://github.com/test/repo.git is rewritten (url.insteadOf) to a local
 bare repo, so it counts as a server while a plain folder remote does not.
-Everything is aged two years, then the fresh cases are made. Run: python3 test_inventory.py"""
+Everything is aged two years, then the fresh cases are made.
+Run: python3 test_inventory.py, or pytest (the same test). For macOS, Linux and Windows."""
 import datetime
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.dont_write_bytecode = True  # no __pycache__ left in the plugin
+import inventory as inv  # noqa: E402
 URL = "https://github.com/test/repo.git"
 OLD = time.time() - 2 * 365 * 86400
 
@@ -23,7 +28,7 @@ def sh(*cmd, cwd=None):
 
 def write(path, text="x"):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(text)
 
 
@@ -41,9 +46,50 @@ def exclude(repo, pattern):
 
 
 def age(top):
+    nofollow = os.utime in os.supports_follow_symlinks  # not on Windows
     for d, dirs, files in os.walk(top):
         for n in dirs + files:
-            os.utime(os.path.join(d, n), (OLD, OLD), follow_symlinks=False)
+            f = os.path.join(d, n)
+            if nofollow or not os.path.islink(f):
+                os.utime(f, (OLD, OLD), **({"follow_symlinks": False} if nofollow else {}))
+
+
+def idle(path, cwd):
+    """A process that sits in cwd, holding path open when one is given."""
+    code = "import sys, time\nf = open(sys.argv[1]) if len(sys.argv) > 1 else None\ntime.sleep(300)"
+    return subprocess.Popen([sys.executable, "-c", code] + ([path] if path else []), cwd=cwd)
+
+
+def rmtree(top):
+    def writable(fn, path, _):  # Windows: git objects are read-only
+        os.chmod(path, stat.S_IWRITE)
+        fn(path)
+    shutil.rmtree(top, **({"onexc": writable} if sys.version_info >= (3, 12) else {"onerror": writable}))
+
+
+def plugin_checks(t):
+    """Plugin caches: unreadable records or uncounted sessions never come out safe."""
+    home, bad = os.path.join(t, "home"), []
+    base = os.path.join(home, ".claude", "plugins")
+    write(os.path.join(base, "cache", "gone", "x"))
+    write(os.path.join(base, "known_marketplaces.json"), "{}")
+    write(os.path.join(base, "installed_plugins.json"), '{"plugins": {}}')
+    inv.HOME = home
+    try:
+        for others, want in ((0, "safe"), (2, "active"), (None, "active")):
+            got = [i["verdict"] for i in inv.plugin_items(others)]
+            if got != [want]:
+                bad.append(f"plugin cache with {others} other sessions: want {want}, got {got}")
+        with open(os.path.join(base, "installed_plugins.json"), "wb") as f:
+            f.write(b'{"plugins": {"\xff": []}}')  # not UTF-8
+        got = [i["verdict"] for i in inv.plugin_items(0)]
+        if got != ["active"]:
+            bad.append(f"plugin cache with unreadable records: want active, got {got}")
+    finally:
+        inv.HOME = os.path.expanduser("~")
+    if not isinstance(inv.other_claude_sessions(), int):
+        bad.append("other_claude_sessions: cannot count processes on this OS")
+    return bad
 
 
 def inventory(*args):
@@ -54,12 +100,12 @@ def inventory(*args):
     return 0, {os.path.realpath(i["path"]): i for i in json.loads(p.stdout)["items"]}
 
 
-def main():
+def test_inventory():
     t = os.path.realpath(tempfile.mkdtemp(prefix="cleanup-test-"))
     remote, dev = os.path.join(t, "remote.git"), os.path.join(t, "dev")
     cfg = os.path.join(t, "gitconfig")
     write(cfg, f'[user]\n\tname = t\n\temail = t@example.com\n[init]\n\tdefaultBranch = main\n'
-               f'[url "{remote}"]\n\tinsteadOf = {URL}\n')
+               f'[url "{remote.replace(os.sep, "/")}"]\n\tinsteadOf = {URL}\n')  # git reads a backslash as an escape
     os.environ.update(GIT_CONFIG_GLOBAL=cfg, GIT_CONFIG_NOSYSTEM="1",
                       GIT_AUTHOR_DATE="2024-01-01T00:00:00", GIT_COMMITTER_DATE="2024-01-01T00:00:00")
     procs = []
@@ -69,11 +115,12 @@ def main():
         sh("git", "clone", "-q", URL, seed)
         commit(seed, "README")
         commit(seed, "a.txt")
-        os.symlink("README", os.path.join(seed, "link"))
-        sh("git", "-C", seed, "add", "link")
+        blob = subprocess.run(["git", "-C", seed, "hash-object", "-w", "--stdin"], input="README",
+                              capture_output=True, text=True, check=True).stdout.strip()
+        sh("git", "-C", seed, "update-index", "--add", "--cacheinfo", f"120000,{blob},link")  # a symlink, also on Windows
         sh("git", "-C", seed, "commit", "-qm", "link")
         sh("git", "-C", seed, "push", "-q", "origin", "main")
-        p = {k: os.path.join(dev, k) for k in "ABCDEFGHIJKLMNPQRSUVWXY"}
+        p = {k: os.path.join(dev, k) for k in "ABCDEFGHIJKLMNPQRSUVWXYZ"}
         for k in p:
             sh("git", "clone", "-q", URL, p[k])
         sh("git", "clone", "-q", remote, os.path.join(dev, "O"))  # remote is a folder on this disk
@@ -123,6 +170,7 @@ def main():
         os.chmod(os.path.join(p["W"], "README"), 0)  # listed first and cannot be hashed: not clean
         sh("git", "-C", p["X"], "update-index", "--skip-worktree", "link")  # unedited symlink: clean
         sh("git", "-C", p["Y"], "tag", "t2")  # a tag name the remote does not have
+        write(os.path.join(p["Z"], "caf\u00e9 notes.txt"), "work")  # untracked, a name that is not ASCII
 
         age(dev)
         # Fresh cases, after aging.
@@ -130,17 +178,16 @@ def main():
         sh("git", "clone", "-q", URL, a2)
         write(os.path.join(p["S"], ".env"), "written now")
         write(os.path.join(p["I"], ".git", "index.lock"), "")
-        procs.append(subprocess.Popen(["sleep", "300"], cwd=p["J"]))
-        procs.append(subprocess.Popen(["tail", "-f", os.path.join(p["V"], "log.txt")], cwd="/",
-                                      stdout=subprocess.DEVNULL))
-        time.sleep(0.5)
+        procs.append(idle(None, cwd=p["J"]))
+        procs.append(idle(os.path.join(p["V"], "log.txt"), cwd=t))
+        time.sleep(1)
 
         rc, got = inventory("--root", dev)
         assert rc == 0, "inventory failed"
         want = {"A": "safe", "B": "unsafe", "C": "unsafe", "D": "unsafe", "E": "backup-first", "F": "safe",
                 "G": "unsafe", "H": "unsafe", "I": "active", "J": "active", "K": "keep", "L": "safe",
                 "M": "unsafe", "N": "unsafe", "O": "unsafe", "P": "unsafe", "Q": "backup-first", "R": "keep",
-                "S": "active", "U": "unsafe", "V": "active", "W": "unsafe", "X": "safe", "Y": "unsafe",
+                "S": "active", "U": "unsafe", "V": "active", "W": "unsafe", "X": "safe", "Y": "unsafe", "Z": "unsafe",
                 "A2": "active"}
         p["A2"] = a2
         bad = [f"{k}: want {v}, got {got[p[k]]['verdict']} {got[p[k]]['active'] + got[p[k]]['unsafe']}"
@@ -155,6 +202,8 @@ def main():
             (any("expired" in n for n in got[p["L"]]["notes"]), "L expired note"),
             (got[p["B"]]["unpushed"] == {"main": 1}, f"B unpushed {got[p['B']]['unpushed']}"),
             (got[p["M"]]["untracked"] == ["src/build/feature.py"], f"M untracked {got[p['M']]['untracked']}"),
+            (got[p["H"]]["local_only"] == [], f"H: nested repo files listed as local_only {got[p['H']]['local_only']}"),
+            (got[p["Z"]]["untracked"] == ["caf\u00e9 notes.txt"], f"Z untracked {got[p['Z']]['untracked']}"),
             (any("tag" in u for u in got[p["N"]]["unsafe"]), "N tag reason"),
             (any("folder on this disk" in u for u in got[p["O"]]["unsafe"]), "O local remote reason"),
             (any("hidden change" in u for u in got[p["P"]]["unsafe"]), "P hidden change reason"),
@@ -170,15 +219,17 @@ def main():
         rc, one = inventory("--only", w1)
         if not one or one[w1]["verdict"] != "safe":
             bad.append("--only wt1: want safe")
+        bad += plugin_checks(t)
         assert not bad, "\n".join(bad)
-        print(f"ok: {len(want) + 4 + len(checks) + 3} checks")
+        print(f"ok: {len(want) + 4 + len(checks) + 3 + 5} checks")
     finally:
         for pr in procs:
             pr.kill()
+            pr.wait()  # Windows: a folder a process sits in cannot be deleted
         if "W" in locals().get("p", {}):
             os.chmod(os.path.join(p["W"], "README"), 0o644)
-        shutil.rmtree(t, ignore_errors=True)
+        rmtree(t)
 
 
 if __name__ == "__main__":
-    main()
+    test_inventory()

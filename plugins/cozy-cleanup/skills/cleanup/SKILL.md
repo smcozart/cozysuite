@@ -12,22 +12,31 @@ work at the same time: never touch a folder that they use or that is in flight.
 
 The script `scripts/inventory.py` (in this skill's base directory) does the
 checks. It only reads; its one write is `git fetch --prune` on clones that are
-not active. Run it with `python3`. `--help` lists the options.
+not active. Run it with `python3` (nothing to install). `--help`
+lists the options. The commands below work in a POSIX shell: macOS, Linux, and
+Git Bash on Windows.
 
 ## 1. Lock and read
 
-1. `mkdir ~/.claude/cleanup.lock && echo "pid $$ $(date)" > ~/.claude/cleanup.lock/owner`.
+1. `mkdir ~/.claude/cleanup.lock && echo "session ${CLAUDE_CODE_SESSION_ID:-unknown} in $PWD, $(date)" > ~/.claude/cleanup.lock/owner`.
    If `mkdir` fails, another cleanup runs or one crashed: show the `owner`
    file and stop. Only the developer removes a lock. Remove your own lock
    when you finish or stop, on every path.
-2. Run `python3 <base>/scripts/inventory.py`. With no `--root` it scans
-   `~/dev` and `~/.factory`. `--root` replaces those defaults: to scan another
-   place as well, pass `--root ~/dev --root ~/.factory --root <folder>`; to
-   scan only the places the developer names, pass only those. Keep the defaults (`--active-hours 24`, `--keep-days 30`) unless the
+2. Run `python3 <base>/scripts/inventory.py`. With no `--root` it scans the
+   folders listed in `~/.config/cozy-cleanup/roots` (one per line, `#` for
+   comments), else `~/dev` and `~/.factory`. If `roots_from` in the JSON says
+   `default: no roots file`, ask the developer once which folders hold their
+   code (on Windows often another drive: write `D:/dev`, not `/d/dev`), write them to that
+   file (`mkdir -p ~/.config/cozy-cleanup` first), and run again.
+   `roots_missing` lists roots that are not there (a drive not attached): say
+   so. `--root` replaces the roots for one run: pass only the places the
+   developer names. Keep the defaults (`--active-hours 24`, `--keep-days 30`) unless the
    developer gives other values. Never lower them to get an item through.
    Never pass `--no-gh` or `--no-fetch`: they turn checks off and are for
    tests only. If `gh` is `false` in the JSON, most items come out `keep` or
-   `active`: ask the developer to run `gh auth login`, then run again.
+   `active`: ask the developer to run `gh auth login`, then run again. If
+   `in_use_check` is not `ok`, no process check ran and every clone comes out
+   `active`: tell the developer its reason (on macOS or Linux, install `lsof`).
 3. Read the JSON. Each item has a `verdict` and its reasons.
 
 | Verdict | Means | Proposed action |
@@ -44,7 +53,7 @@ Also in the JSON:
   `active` reasons.
 - `plugin-cache`: caches of Claude Code marketplaces that nothing uses. Delete
   only while `other_claude_sessions` is 0: a running session may still read
-  them.
+  them. `null` means the sessions could not be counted: not 0.
 - `install-record`: plugin records for folders that are gone. They are
   harmless. List them; never edit `~/.claude/plugins/installed_plugins.json`.
 - `size_mb` of a clone includes its nested repos. Do not add both to a total.
@@ -69,7 +78,10 @@ removes or adds items. Run nothing that changes state before they say yes.
 ## 3. Make an approved item safe
 
 Backups go to `~/.claude/backups/cleanup-<YYYY-MM-DD>/`. Make the folder with
-`(umask 077; mkdir -p <folder>)`.
+`(umask 077; mkdir -p <folder>)` (on Windows it takes the private permissions of
+the home folder instead). Write the backup folder starting with `~/`, never as
+`C:/...`: GNU tar, as in Git Bash, reads `C:` in a `-f` path as a remote host.
+The `-C <repo>` path may be the JSON's path as it is.
 
 - Unpushed commits on a branch: `git -C <repo> push origin <branch>`. A tag:
   `git -C <repo> push origin <tag>`. Never `--force`, never `--no-verify`. If
@@ -115,7 +127,8 @@ than in the plan: skip the item and report it. Then:
   `-D` only when `notes` say the branch was merged as a PR at that tip. Then
   `git -C <main> worktree prune`.
 - Clone or nested repo: `rm -rf '<absolute path>'`, one literal path per
-  command.
+  command. On Windows a file that a process holds open cannot be deleted: if
+  `rm` reports one, stop on that item and report it as `active`.
 - Deps: `rm -rf '<absolute path>'` for each approved `deps` path.
 - Plugin cache: `rm -rf '<absolute path>'`, only while `other_claude_sessions`
   is 0.
@@ -125,7 +138,9 @@ Never delete: a scan root, your home folder, a path outside the scan roots
 in, a path written with a variable or a glob. Never delete a remote branch.
 Never archive or unarchive a repo without the developer's yes.
 
-The in-use check sees open files and working folders. An agent that only runs
+The in-use check sees open files, open folders and working folders (`lsof` on
+macOS and Linux; on Windows the system's handle table). Like `lsof` without
+`sudo`, it does not see processes of other users or ones run as administrator. An agent that only runs
 short commands in a folder (`git -C`) shows up as recent activity instead:
 that is why `--active-hours` stays at 24 or more while agents run. Activity
 comes from commits, the index, `HEAD` and changed files. A fetch or a
@@ -134,6 +149,7 @@ tag or worktree) still fails the content checks.
 
 ## 5. Report
 
-What you deleted and the space freed (`df -h ~` before and after), what you
+What you deleted and the space freed (`df -h <each root> ~` before and after:
+one line per drive or volume), what you
 pushed (repo, branch or tag, sha), each backup (path, file count), and what you
 skipped, with the reason. Then remove `~/.claude/cleanup.lock`.

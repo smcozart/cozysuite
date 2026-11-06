@@ -1,0 +1,22 @@
+name: cozy-cleanup
+on:
+  pull_request:
+    paths: ["plugins/cozy-cleanup/**", ".github/workflows/cozy-cleanup.yml"]
+  push:
+    branches: [main]
+    paths: ["plugins/cozy-cleanup/**", ".github/workflows/cozy-cleanup.yml"]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python plugins/cozy-cleanup/skills/cleanup/scripts/test_inventory.py
