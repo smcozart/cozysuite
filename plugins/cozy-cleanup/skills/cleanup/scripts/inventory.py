@@ -25,6 +25,9 @@ import sys
 import time
 
 HOME = os.path.expanduser("~")
+WINDOWS = os.name == "nt"
+ROOTS_FILE = os.path.join(HOME, ".config", "cozy-cleanup", "roots")  # one folder per line
+DEFAULT_ROOTS = ["~/dev", "~/.factory"]
 # Ignored folders and files that a build or install makes again. Everything else
 # git ignores (.env, local databases, notes) is local-only and goes to a backup.
 # Untracked (not ignored) files are never treated as build output.
@@ -46,7 +49,8 @@ ENV = dict(os.environ, GIT_TERMINAL_PROMPT="0", GH_PROMPT_DISABLED="1",
 
 def run(cmd, timeout=120):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=ENV)
+        p = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="surrogateescape",
+                           timeout=timeout, env=ENV)
         return p.returncode, p.stdout
     except (OSError, subprocess.TimeoutExpired):
         return 1, ""
@@ -64,12 +68,27 @@ def size_mb(path):
         return None
 
 
-def load_json(path, default):
+def load_json(path):
+    """Parsed JSON, or None when the file is missing or unreadable (never an empty default)."""
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
-        return default
+        return None
+
+
+def norm(path):
+    """One spelling per folder: links resolved; on Windows also one case and one separator."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def key(path):
+    """One spelling per path without touching the disk (git's / and Windows' backslash alike)."""
+    return os.path.normcase(os.path.normpath(path))
+
+
+def posix(rel):
+    return rel.replace(os.sep, "/")
 
 
 def is_repo(d):
@@ -79,7 +98,7 @@ def is_repo(d):
 def is_linked_worktree(d):
     rc1, gd = git(d, "rev-parse", "--absolute-git-dir")
     rc2, cd = git(d, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    return rc1 == 0 and rc2 == 0 and os.path.realpath(gd.strip()) != os.path.realpath(cd.strip())
+    return rc1 == 0 and rc2 == 0 and norm(gd.strip()) != norm(cd.strip())
 
 
 def hosted(url):
@@ -138,20 +157,21 @@ def nested_repos(repo):
 
 def walk_files(repo, full, nested, skip_regen):
     """Files under a folder, outside nested repos (and outside build output when
-    skip_regen). Returns (paths relative to repo, capped, newest mtime)."""
+    skip_regen; nested holds key() spellings). Returns (paths relative to repo, with /,
+    capped, newest mtime). A path git named that cannot be read is listed as it is."""
     hits, newest, capped, seen = [], 0.0, False, 0
-    if os.path.isfile(full) or os.path.islink(full):
+    if not os.path.isdir(full) or os.path.islink(full):
         try:
             newest = os.lstat(full).st_mtime
         except OSError:
             pass
-        return [os.path.relpath(full, repo)], False, newest
+        return [posix(os.path.relpath(full, repo))], False, newest
     for d, dirs, files in os.walk(full):
         dirs[:] = [x for x in dirs if x not in SKIP_WALK and not (skip_regen and x in REGEN_NAMES)
-                   and os.path.join(d, x) not in nested]
+                   and key(os.path.join(d, x)) not in nested]
         for f in files:
             fp = os.path.join(d, f)
-            r = os.path.relpath(fp, repo)
+            r = posix(os.path.relpath(fp, repo))
             if skip_regen and regenerable(r):
                 continue
             try:
@@ -182,39 +202,155 @@ def worktrees(repo):
     return items  # items[0] is the main working tree (or the bare repo)
 
 
-def busy_paths():
-    """Every path a process has open (files and working folders), plus herdr agent
-    folders. None when lsof gives nothing: then nothing can be proved idle."""
+def open_paths():
+    """Every path a process has open: files, folders and working folders.
+    Returns (paths, None), or (None, why) when they cannot be read."""
+    if WINDOWS:
+        try:
+            return windows_open_paths(), None
+        except (OSError, StopIteration, ValueError) as e:
+            return None, f"cannot read open handles: {e or type(e).__name__}"
     if not shutil.which("lsof"):
-        return None
+        return None, "lsof is not installed"
     _, out = run(["lsof", "-w", "-n", "-P", "-Fn"], timeout=180)
-    paths = {os.path.realpath(l[1:]) for l in out.splitlines() if l.startswith("n/")}
+    paths = {l[1:] for l in out.splitlines() if l.startswith("n/")}
+    return (paths, None) if paths else (None, "lsof gave nothing")
+
+
+def windows_open_paths():
+    """Windows has no lsof. One snapshot of the system handle table, then the path of
+    every file handle in each process we may read: open files, folders held open, and
+    working folders (a process's working folder, and Git Bash's, is an open handle).
+    ponytail: another user's or an elevated process is not seen, as with lsof without sudo."""
+    import ctypes
+    import msvcrt
+    import queue
+    import threading
+    from ctypes import wintypes as w
+
+    class Entry(ctypes.Structure):  # SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX
+        _fields_ = [("obj", ctypes.c_void_p), ("pid", ctypes.c_size_t), ("handle", ctypes.c_size_t),
+                    ("access", ctypes.c_ulong), ("trace", ctypes.c_ushort), ("type", ctypes.c_ushort),
+                    ("attrs", ctypes.c_ulong), ("reserved", ctypes.c_ulong)]
+
+    ntdll, k32 = ctypes.WinDLL("ntdll"), ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll.NtQuerySystemInformation.argtypes = [ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong,
+                                               ctypes.POINTER(ctypes.c_ulong)]
+    ntdll.NtQuerySystemInformation.restype = ctypes.c_ulong
+    k32.OpenProcess.restype = w.HANDLE
+    k32.GetCurrentProcess.restype = w.HANDLE
+    k32.DuplicateHandle.argtypes = [w.HANDLE, w.HANDLE, w.HANDLE, ctypes.POINTER(w.HANDLE), w.DWORD, w.BOOL, w.DWORD]
+    k32.GetFileType.argtypes = [w.HANDLE]
+    k32.GetFinalPathNameByHandleW.argtypes = [w.HANDLE, w.LPWSTR, w.DWORD, w.DWORD]
+    k32.CloseHandle.argtypes = [w.HANDLE]
+
+    me, fd = os.getpid(), os.open(sys.executable, os.O_RDONLY)  # a file handle of ours: its type number
+    try:
+        size = 1 << 22
+        while True:
+            buf, need = ctypes.create_string_buffer(size), ctypes.c_ulong()
+            status = ntdll.NtQuerySystemInformation(64, buf, size, ctypes.byref(need))  # extended handles
+            if status != 0xC0000004:  # not STATUS_INFO_LENGTH_MISMATCH
+                break
+            size = max(size * 2, need.value + (1 << 20))
+        if status != 0:
+            raise OSError(f"NtQuerySystemInformation status {status:#x}")
+        n = ctypes.c_size_t.from_buffer(buf).value
+        table = (Entry * n).from_buffer(buf, 2 * ctypes.sizeof(ctypes.c_size_t))
+        mine = msvcrt.get_osfhandle(fd)
+        file_type = next(e.type for e in table if e.pid == me and e.handle == mine)
+    finally:
+        os.close(fd)
+    by_pid = {}
+    for e in table:
+        if e.type == file_type:  # ours too: its working folder counts, as with lsof
+            by_pid.setdefault(e.pid, []).append(e.handle)
+
+    def worker(jobs, results):  # a query can block on a pipe with a pending read: run it aside
+        out = ctypes.create_unicode_buffer(32768)
+        while True:
+            h = jobs.get()
+            n = k32.GetFinalPathNameByHandleW(h, out, 32768, 0) if k32.GetFileType(h) == 1 else 0  # disk
+            results.put(out.value if 0 < n < 32768 else None)
+
+    jobs, results = queue.Queue(), queue.Queue()
+    threading.Thread(target=worker, args=(jobs, results), daemon=True).start()
+    this, paths = k32.GetCurrentProcess(), set()
+    for pid, handles in by_pid.items():
+        proc = k32.OpenProcess(0x40, False, pid)  # PROCESS_DUP_HANDLE
+        if not proc:
+            continue
+        try:
+            for h in handles:
+                dup = w.HANDLE()
+                if not k32.DuplicateHandle(proc, h, this, ctypes.byref(dup), 0, False, 2):  # SAME_ACCESS
+                    continue
+                jobs.put(dup.value)
+                try:
+                    p = results.get(timeout=2)
+                except queue.Empty:  # an unknown path must not read as "nothing open"
+                    raise OSError(f"a handle of process {pid} could not be read") from None
+                k32.CloseHandle(dup)
+                if p:  # the \\?\ form: \\?\C:\x is C:\x, \\?\UNC\host\x is \\host\x
+                    paths.add("\\\\" + p[8:] if p.startswith("\\\\?\\UNC\\") else p[4:] if p.startswith("\\\\?\\") else p)
+        finally:
+            k32.CloseHandle(proc)
     if not paths:
-        return None
+        raise OSError("no open file handles found")
+    return paths
+
+
+def busy_paths():
+    """(normalized paths in use, None), or (None, why): then nothing can be proved idle.
+    Adds herdr agent folders: an agent between commands may hold nothing open."""
+    paths, why = open_paths()
+    if paths is None:
+        return None, why
     if shutil.which("herdr"):
         _, out = run(["herdr", "agent", "list"], timeout=20)
         try:
             for a in json.loads(out)["result"]["agents"]:
                 for k in ("cwd", "foreground_cwd"):
                     if a.get(k):
-                        paths.add(os.path.realpath(a[k]))
+                        paths.add(a[k])
         except (ValueError, KeyError, TypeError):
             pass
-    return paths
+    return {norm(p) for p in paths}, None
+
+
+def process_table():
+    """{pid: (ppid, command line)} for every process, or None when it cannot be read."""
+    procs = {}
+    if WINDOWS:  # Git Bash's ps sees only its own processes; CIM sees all (names always)
+        _, out = run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                      "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-CimInstance Win32_Process | "
+                      "Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress"],
+                     timeout=60)
+        try:
+            for p in json.loads(out):
+                procs[int(p["ProcessId"])] = (int(p["ParentProcessId"]), p["CommandLine"] or p["Name"] or "")
+        except (ValueError, KeyError, TypeError):
+            return None
+    else:
+        _, out = run(["ps", "-axo", "pid=,ppid=,command="])
+        for line in out.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+                procs[int(parts[0])] = (int(parts[1]), parts[2])
+    return procs or None
 
 
 def other_claude_sessions():
-    _, out = run(["ps", "-axo", "pid=,ppid=,command="])
-    procs = {}
-    for line in out.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
-            procs[int(parts[0])] = (int(parts[1]), parts[2])
+    """Claude Code processes outside this one's ancestry, or None when they cannot be counted."""
+    procs = process_table()
+    if procs is None:
+        return None
     mine, p = set(), os.getpid()
     while p in procs and p not in mine and p > 1:
         mine.add(p)
         p = procs[p][0]
-    claude = re.compile(r"(^|/)claude(\s|$)|@anthropic-ai/claude-code|claude-code/cli")
+    claude = re.compile(r'(^|[/\\])claude(\.exe)?("|\s|$)|@anthropic-ai[/\\]claude-code|claude-code[/\\]cli',
+                        re.IGNORECASE)
     return sum(1 for pid, (_, cmd) in procs.items() if pid not in mine and claude.search(cmd))
 
 
@@ -222,6 +358,7 @@ class Ctx:
     def __init__(self, a):
         self.a = a
         self._busy = False  # not taken yet
+        self.busy_why = None
         self.gh = False
         if not a.no_gh and shutil.which("gh"):
             self.gh = run(["gh", "auth", "status"], timeout=20)[0] == 0
@@ -230,7 +367,7 @@ class Ctx:
     @property
     def busy(self):
         if self._busy is False:
-            self._busy = busy_paths()
+            self._busy, self.busy_why = busy_paths()
         return self._busy
 
     def gh_json(self, args):
@@ -247,8 +384,8 @@ class Ctx:
 
 def in_use(path, ctx):
     if ctx.busy is None:
-        return "cannot tell whether a process uses this folder (lsof gave nothing)"
-    real = os.path.realpath(path)
+        return f"cannot tell whether a process uses this folder ({ctx.busy_why})"
+    real = norm(path)
     if any(p == real or p.startswith(real + os.sep) for p in ctx.busy):
         return "a running process or agent has files or its working folder here"
     return None
@@ -302,7 +439,8 @@ def hidden_changes(path):
     disk = {f: blob_sha(os.fsencode(os.readlink(os.path.join(path, f)))) for f in links}
     if files:
         p = subprocess.run(["git", "--no-optional-locks", "-C", path, "hash-object", "--stdin-paths"],
-                           input="\n".join(files), capture_output=True, text=True, env=ENV)
+                           input="\n".join(files), capture_output=True, encoding="utf-8",
+                           errors="surrogateescape", env=ENV)
         hashes = p.stdout.split()
         if p.returncode != 0 or len(hashes) != len(files):
             return -1
@@ -459,12 +597,13 @@ def inspect(path, kind, ctx, nested=()):
         code, rel = e[:2], e[3:]
         if code[0] in "RC":
             next(fields, None)  # the rename's source path
-        full = os.path.join(path, rel)
-        holds = any(n == full.rstrip("/") or n.startswith(full.rstrip("/") + "/") for n in nested)
+        full = os.path.normpath(os.path.join(path, rel))
+        k = key(full)
+        holds = any(n == k or n.startswith(k + os.sep) for n in nested)
         if code == "!!":
             if not holds and regenerable(rel):
                 if rel.endswith("/"):
-                    rec["deps"].append(full.rstrip("/"))
+                    rec["deps"].append(full)
                 continue
             files, capped, newest = walk_files(path, full, nested, skip_regen=True)
             rec["local_only"] += [rel] if capped else files
@@ -519,21 +658,21 @@ def inspect_tree(path, kind, ctx, parent=None):
     """A repo plus the repos inside it. Deleting a folder deletes its nested repos,
     so a parent is never better than its worst nested repo."""
     inner = nested_repos(path)
-    rec = inspect(path, kind, ctx, nested=set(inner))
+    rec = inspect(path, kind, ctx, nested={key(n) for n in inner})
     if parent:
         rec["parent"] = parent
     out = [rec]
     for n in inner:
         sub = inspect_tree(n, "nested", ctx, parent=path)
         out += sub
-        rel = os.path.relpath(n, path)
+        rel = posix(os.path.relpath(n, path))
         if sub[0]["verdict"] == "active":
             rec["active"].append(f"nested repo {rel} is active")
         if sub[0]["verdict"] == "keep":
             rec["keep"].append(f"nested repo {rel} is an ongoing project")
         if sub[0]["unsafe"]:
             rec["unsafe"].append(f"nested repo {rel} holds work on no server remote")
-        rec["local_only"] += [os.path.join(rel, f) for f in sub[0]["local_only"]]
+        rec["local_only"] += [f"{rel}/{f}" for f in sub[0]["local_only"]]
     rec["verdict"] = decide(rec)
     return out
 
@@ -549,26 +688,39 @@ def finish(it, sizes=True):
 
 
 def unmounted(path):
+    """On a drive that is not attached now: a macOS volume, a Windows drive letter or share."""
     vol = re.match(r"^(/Volumes/[^/]+)", path)
-    return bool(vol) and not os.path.ismount(vol.group(1))
+    if vol:
+        return not os.path.ismount(vol.group(1))
+    drive = os.path.splitdrive(path)[0]  # "" on macOS and Linux
+    return bool(drive) and not os.path.exists(drive + os.sep)
 
 
 def plugin_items(others):
     base = os.path.join(HOME, ".claude", "plugins")
-    known = set(load_json(os.path.join(base, "known_marketplaces.json"), {}))
-    installed = load_json(os.path.join(base, "installed_plugins.json"), {}).get("plugins", {})
-    used = [e.get("installPath", "") for v in installed.values() for e in v]
+    known = load_json(os.path.join(base, "known_marketplaces.json"))
+    installed = load_json(os.path.join(base, "installed_plugins.json"))
+    installed = installed.get("plugins") if isinstance(installed, dict) else None
+    readable = isinstance(known, dict) and isinstance(installed, dict)
+    installed = installed if readable else {}
+    used = [key(e.get("installPath") or "") for v in installed.values() for e in v]
+    if others is None:
+        later = "cannot count other Claude Code sessions: delete later"
+    else:
+        later = f"{others} other Claude Code session(s) running: delete later" if others else None
     items = []
     for sub in ("cache", "marketplaces"):
         d = os.path.join(base, sub)
         for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
             full = os.path.join(d, name)
-            if name in known or any(u == full or u.startswith(full + os.sep) for u in used):
+            k = key(full)
+            if readable and (name in known or any(u == k or u.startswith(k + os.sep) for u in used)):
                 continue
+            why = (f"marketplace {name} is not configured and no install uses it" if readable
+                   else "cannot read known_marketplaces.json or installed_plugins.json: use unknown")
             items.append({"path": full, "kind": "plugin-cache", "size_mb": size_mb(full),
-                          "verdict": "active" if others else "safe",
-                          "notes": [f"marketplace {name} is not configured and no install uses it"]
-                          + ([f"{others} other Claude Code session(s) running: delete later"] if others else [])})
+                          "verdict": "safe" if readable and not later else "active",
+                          "notes": [why] + ([later] if later else [])})
     for pid, entries in installed.items():
         for e in entries:
             pp = e.get("projectPath")
@@ -581,9 +733,19 @@ def plugin_items(others):
     return items
 
 
+def configured_roots():
+    """The folders listed in ROOTS_FILE (blank lines and # comments skipped), or None."""
+    try:
+        with open(ROOTS_FILE, encoding="utf-8") as f:
+            return [l.strip() for l in f if l.strip() and not l.lstrip().startswith("#")] or None
+    except FileNotFoundError:
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--root", action="append", help="folder to scan (repeatable); default ~/dev and ~/.factory")
+    ap.add_argument("--root", action="append",
+                    help=f"folder to scan (repeatable); default: the folders in {ROOTS_FILE}, else ~/dev and ~/.factory")
     ap.add_argument("--only", help="re-check one clone or worktree (its top folder) right before acting on it")
     ap.add_argument("--active-hours", type=float, default=24, help="changed this recently: active (default 24)")
     ap.add_argument("--keep-days", type=float, default=30, help="used or pushed this recently: ongoing (default 30)")
@@ -594,12 +756,12 @@ def main():
     ctx = Ctx(a)
     others = other_claude_sessions()
     report = {"generated": datetime.datetime.now().isoformat(timespec="seconds"),
-              "gh": bool(ctx.gh), "other_claude_sessions": others, "items": []}
+              "gh": bool(ctx.gh), "other_claude_sessions": others, "in_use_check": None, "items": []}
 
     if a.only:
         p = os.path.realpath(os.path.expanduser(a.only))
         rc, top = git(p, "rev-parse", "--show-toplevel")
-        if rc != 0 or os.path.realpath(top.strip()) != p:
+        if rc != 0 or norm(top.strip()) != norm(p):
             print(json.dumps({"error": f"{p} is not the top folder of a clone or worktree: "
                                        "re-check its clone instead"}))
             sys.exit(2)
@@ -609,25 +771,29 @@ def main():
             rec = inspect(p, "worktree", ctx)
             wl = worktrees(p)
             rec["main"] = wl[0].get("worktree") if wl else None
-            if any("locked" in w for w in wl if os.path.realpath(w.get("worktree", "")) == p):
+            if any("locked" in w for w in wl if w.get("worktree") and norm(w["worktree"]) == norm(p)):
                 rec["active"].append("worktree is locked (git worktree lock)")
         ctx._busy = False  # a fresh process snapshot, taken last
         busy = in_use(p, ctx)
         if busy and busy not in rec["active"]:
             rec["active"].append(busy)
         rec["verdict"] = decide(rec)
+        report["in_use_check"] = ctx.busy_why or "ok"
         report["items"] = [finish(rec, sizes=False)]
         print(json.dumps(report, indent=1))
         return
 
-    roots = [os.path.abspath(os.path.expanduser(r)) for r in (a.root or ["~/dev", "~/.factory"])]
+    listed = None if a.root else configured_roots()
+    report["roots_from"] = "--root" if a.root else ROOTS_FILE if listed else "default: no roots file"
+    roots = [os.path.abspath(os.path.expanduser(r)) for r in (a.root or listed or DEFAULT_ROOTS)]
     report["roots"] = [r for r in roots if os.path.isdir(r)]
+    report["roots_missing"] = [r for r in roots if not os.path.isdir(r)]
     seen, wts = set(), []
     for r in report["roots"]:
         for repo in find_repos(r, 3):
-            if os.path.realpath(repo) in seen or is_linked_worktree(repo):
+            if norm(repo) in seen or is_linked_worktree(repo):
                 continue
-            seen.add(os.path.realpath(repo))
+            seen.add(norm(repo))
             report["items"] += inspect_tree(repo, "clone", ctx)
             wts += [(w, repo) for w in worktrees(repo)[1:] if "worktree" in w]
     for w, main_repo in wts:
@@ -646,6 +812,7 @@ def main():
         rec["verdict"] = decide(rec)
         report["items"].append(rec)
     report["items"] = [finish(it) for it in report["items"]]
+    report["in_use_check"] = (ctx.busy_why or "ok") if ctx._busy is not False else "not needed"
     if not a.no_plugins:
         report["items"] += plugin_items(others)
     print(json.dumps(report, indent=1))
