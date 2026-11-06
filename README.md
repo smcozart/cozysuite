@@ -1,15 +1,16 @@
 # cozysuite — Claude Code tools
 
-One catalog. Each tool lives in its own repo; this file pins the version.
+One catalog. Each tool lives in its own repo, pinned here by tag and sha;
+`cozysuite` and `cozy-cleanup` live in this repo.
 **Tools install per project, never at user scope**: a repo loads only what its
 committed `.claude/settings.json` names.
 
 | Plugin | Solves | Source |
 |---|---|---|
 | `cozysuite` | `/cozysuite:setup` picks a project's tools: it reads the repo, recommends a preset ± tools, and installs at project scope after you confirm. You start it; it costs no context until then. | `./plugins/cozysuite` |
-| `core` (preset) | Any code repo under the workflow: `ai-sdlc`, `ponytail`, `cozy-view`, `cozy-setup`, `cozy-cleanup`. | `./plugins/core` |
+| `core` (preset) | Any code repo under the workflow: `ai-sdlc`, `ponytail`, `cozy-view`, `cozy-setup`. | `./plugins/core` |
 | `site` (preset) | A cozystudio client site: `studio`, `cozyskills`. | `./plugins/site` |
-| `cozy-cleanup` | `/cozy-cleanup:cleanup` frees disk space without losing work: it proves what is on GitHub (pushed, or merged as a PR), backs up what git cannot hold, keeps ongoing projects, and deletes only what you approve. Safe while other agents work. You start it. | `./plugins/cozy-cleanup` |
+| `cozy-cleanup` | `/cozy-cleanup:cleanup` frees disk space without losing work: it proves what is on GitHub (pushed, or merged as a PR), backs up what git cannot hold, keeps ongoing projects, and deletes only what you approve. Safe while other agents work. You start it. It cleans the whole machine, so install it in one project (your main workspace), not in every repo. | `./plugins/cozy-cleanup` |
 | `ai-sdlc` | Ties agent work to source control and sets up agent orchestration of issues. Needs `mattpocock-skills` (installed with it). | `smcozart/cozy_ai-sdlc` › `plugin/` |
 | `ponytail` | Third party: forces the simplest, shortest solution that works. Pinned here, so it moves only when this catalog does. | `DietrichGebert/ponytail` |
 | `cozy-setup` | The Cozy Architect output style (select `cozy-setup:Cozy Architect` once) and the macOS PATH guard hook. Private. | `smcozart/cozy_setup` |
