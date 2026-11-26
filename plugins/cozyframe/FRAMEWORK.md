@@ -1,6 +1,6 @@
 # The cozyframe framework
 
-**Status:** inferred on 2026-11-26 from the owner's recorded decisions (smcozart/cozy_ai-sdlc#121 and its threads). The owner must confirm or edit each principle before v0 runs on real work. Version: 0.1.
+**Status:** confirmed by the owner on 2026-11-26 ("framework confirmed"); inferred from the owner's recorded decisions (smcozart/cozy_ai-sdlc#121 and its threads). Version: 0.1.
 
 Each principle is a test the evaluator can apply. "Source" quotes the owner's own words.
 
