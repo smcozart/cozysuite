@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # Earns its place
 
-The **target** is the folder, repo, tag or plugin the developer names. The **framework** is `../../FRAMEWORK.md`; read it first and apply every principle in it. This run reads only. It writes one report file and changes nothing else: no edits, commits, issues, comments or installs.
+The **target** is the folder, repo, tag or plugin the developer names. The **framework** is `FRAMEWORK.md`, two folders above this skill's base directory (the plugin root). Read it first and apply every principle in it. This run reads only. It writes one report file and changes nothing else: no edits, commits, issues, comments or installs.
 
 ## 1. Goal
 
@@ -24,7 +24,7 @@ List the 3 to 5 non-negotiables that make the target itself. For example: "a hum
 
 ## 3. Inventory
 
-List every part: each skill, rule, gate check, hook, doc, template file and script. Give each one its cost, measured, not estimated: words, lines, runtime (run it, time it), and how often an agent must read it.
+List every part: each skill, rule, gate check, hook, doc, template file and script. A part is the smallest unit that can be cut on its own: each gate check, each hook, each skill step and each rule is its own part, never a group ("the gate's 12 checks" is 12 parts). Give each one its cost, measured, not estimated: words, lines, runtime (run it, time it), and how often an agent must read it.
 
 **Done when:** every file in the target is in a part or named as outside the inventory, and every cost is a number.
 
