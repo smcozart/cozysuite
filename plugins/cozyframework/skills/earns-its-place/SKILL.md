@@ -1,6 +1,6 @@
 ---
 name: earns-its-place
-description: Judge an agentic tool (plugin, skill, harness, app) against the cozyframe framework. Is its goal defined, does every part earn its place, and what is the smallest change that keeps its purpose and character? Read-only; it recommends and never edits.
+description: Judge an agentic tool (plugin, skill, harness, app) against the cozyframework framework. Is its goal defined, does every part earn its place, and what is the smallest change that keeps its purpose and character? Read-only; it recommends and never edits.
 disable-model-invocation: true
 ---
 
@@ -64,4 +64,4 @@ Then write the A/B plan:
 
 Saying "this tool is lean; change nothing" is a valid result when the evidence supports it.
 
-**Done when:** the report is written to the path the developer names (default `cozyframe-report-<target>-<YYYY-MM-DD>.md` in the current folder). It holds the confirmed goal, the confirmed character, the inventory with costs and verdicts, at most 5 recommendations, and the A/B plan.
+**Done when:** the report is written to the path the developer names (default `cozyframework-report-<target>-<YYYY-MM-DD>.md` in the current folder). It holds the confirmed goal, the confirmed character, the inventory with costs and verdicts, at most 5 recommendations, and the A/B plan.

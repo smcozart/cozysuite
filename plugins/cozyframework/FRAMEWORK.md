@@ -1,4 +1,4 @@
-# The cozyframe framework
+# cozyframework
 
 **Status:** confirmed by the owner on 2026-11-26 ("framework confirmed"); inferred from the owner's recorded decisions (smcozart/cozy_ai-sdlc#121 and its threads). Version: 0.1.
 
