@@ -32,6 +32,10 @@ claude plugin marketplace update cozysuite      # the local copy is not refreshe
 claude plugin install cozysuite@cozysuite --scope project
 ```
 
+Then in `.claude/settings.json`, add `"autoUpdate": false` to the `cozysuite` entry under
+`extraKnownMarketplaces` (beside its `source`). A setting there wins over Claude Code's
+auto-update default, so the catalog moves only when you run the upgrade below.
+
 Then in Claude Code: `/reload-plugins`, `/cozysuite:setup`, confirm, `/reload-plugins`,
 and commit `.claude/settings.json`. For the workflow files, say "start a new project"
 (ai-sdlc `new-project`).

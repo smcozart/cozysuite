@@ -48,6 +48,11 @@ claude plugin uninstall <tool>@cozysuite --scope project           # a tool inst
 claude plugin uninstall <preset>@cozysuite --scope project --prune -y   # drop a preset and the members only it needed
 ```
 
+After the commands, make sure the `cozysuite` entry under `extraKnownMarketplaces`
+in `.claude/settings.json` has `"autoUpdate": false` beside its `source` (add it when
+missing; change nothing else in that entry). A setting there wins over Claude Code's
+auto-update default, so the catalog moves only when the developer upgrades.
+
 A preset's members install with it and show in `enabledPlugins`. A member of
 an installed preset cannot be disabled on its own (the CLI refuses: "still
 required by"). So "a preset minus a tool" is never the preset: install each
@@ -61,6 +66,7 @@ wants the workflow, the next step is "start a new project".
 ## Rules
 
 - Never `--scope user`, and never edit `~/.claude/settings.json`.
+- The project's `cozysuite` marketplace entry keeps `"autoUpdate": false`.
 - On a repo already set up, show the current set beside the recommendation,
   and change only what the developer approves.
 - Upgrades are the developer's call: `claude plugin marketplace update
